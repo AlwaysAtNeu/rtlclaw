@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vcd
+
+# Test project directories (user-local)
+test*/
+untitled/
+.claude/

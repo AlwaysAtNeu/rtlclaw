@@ -1,0 +1,151 @@
+# Built-in EDA tool definitions for RTL-Claw.
+# Each tool defines its commands, file extensions, and error/warning patterns.
+
+tools:
+  iverilog:
+    name: iverilog
+    displayName: Icarus Verilog
+    category: simulator
+    executable: iverilog
+    commands:
+      compile: "iverilog -g2012 -o ${output} ${sources}"
+      simulate: "vvp ${output}"
+      lint: "iverilog -g2012 -Wall -t null ${sources}"
+    fileExtensions: [".v", ".sv", ".vh"]
+    errorPatterns:
+      - pattern: '^(.+?):(\d+):\s*error:\s*(.+)$'
+        severity: error
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 3
+      - pattern: '^(.+?):(\d+):\s*warning:\s*(.+)$'
+        severity: warning
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 3
+      - pattern: '^(.+?):(\d+):\s*syntax error'
+        severity: error
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 0
+
+  vcs:
+    name: vcs
+    displayName: Synopsys VCS
+    category: simulator
+    executable: vcs
+    commands:
+      compile: "vcs -sverilog -full64 -debug_access+all -o ${output} ${sources}"
+      simulate: "./${output}"
+      lint: "vcs -sverilog -full64 -lint=all ${sources}"
+    fileExtensions: [".v", ".sv", ".vh", ".svh"]
+    errorPatterns:
+      - pattern: '^Error-\[\w+\]\s*(.+)'
+        severity: error
+        messageGroup: 1
+      - pattern: '^Warning-\[\w+\]\s*(.+)'
+        severity: warning
+        messageGroup: 1
+      - pattern: '^\s*"(.+?)",\s*(\d+):'
+        severity: error
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 0
+
+  verilator:
+    name: verilator
+    displayName: Verilator
+    category: simulator
+    executable: verilator
+    commands:
+      compile: "verilator --binary -j 0 -Wall -o ${output} ${sources}"
+      lint: "verilator --lint-only -Wall ${sources}"
+      simulate: "./${output}"
+    fileExtensions: [".v", ".sv", ".vh", ".svh"]
+    errorPatterns:
+      - pattern: '%Error(?:-\w+)?:\s*(.+?):(\d+):\d+:\s*(.+)'
+        severity: error
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 3
+      - pattern: '%Warning(?:-\w+)?:\s*(.+?):(\d+):\d+:\s*(.+)'
+        severity: warning
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 3
+
+  vivado:
+    name: vivado
+    displayName: Xilinx Vivado
+    category: synthesizer
+    executable: vivado
+    commands:
+      synthesize: "vivado -mode batch -source ${script}"
+      simulate: "vivado -mode batch -source ${script}"
+      program: "vivado -mode batch -source ${script}"
+    fileExtensions: [".v", ".sv", ".vhd", ".xdc", ".tcl"]
+    errorPatterns:
+      - pattern: '^ERROR:\s*\[(.+?)\]\s*(.+)'
+        severity: error
+        messageGroup: 2
+      - pattern: '^WARNING:\s*\[(.+?)\]\s*(.+)'
+        severity: warning
+        messageGroup: 2
+      - pattern: '^CRITICAL WARNING:\s*\[(.+?)\]\s*(.+)'
+        severity: error
+        messageGroup: 2
+
+  yosys:
+    name: yosys
+    displayName: Yosys Open Synthesis Suite
+    category: synthesizer
+    executable: yosys
+    commands:
+      synthesize: "yosys -p '${script}'"
+      read: "yosys -p 'read_verilog -sv ${sources}; hierarchy -check'"
+      synth_generic: "yosys -p 'read_verilog -sv ${sources}; synth -top ${top}; write_verilog ${output}'"
+    fileExtensions: [".v", ".sv", ".vh", ".ys"]
+    errorPatterns:
+      - pattern: '^ERROR:\s*(.+)'
+        severity: error
+        messageGroup: 1
+      - pattern: '^Warning:\s*(.+)'
+        severity: warning
+        messageGroup: 1
+      - pattern: '^(.+?):(\d+):\s*ERROR:\s*(.+)'
+        severity: error
+        fileGroup: 1
+        lineGroup: 2
+        messageGroup: 3
+
+  dc:
+    name: dc
+    displayName: Synopsys Design Compiler
+    category: synthesizer
+    executable: dc_shell
+    commands:
+      synthesize: "dc_shell -f ${script}"
+    fileExtensions: [".v", ".sv", ".tcl", ".sdc"]
+    errorPatterns:
+      - pattern: '^Error:\s*(.+?)\s*\((.+?):(\d+)\)'
+        severity: error
+        fileGroup: 2
+        lineGroup: 3
+        messageGroup: 1
+      - pattern: '^Warning:\s*(.+)'
+        severity: warning
+        messageGroup: 1
+      - pattern: '^Error:\s*(.+)'
+        severity: error
+        messageGroup: 1
+
+  gtkwave:
+    name: gtkwave
+    displayName: GTKWave
+    category: viewer
+    executable: gtkwave
+    commands:
+      open: "gtkwave ${vcdFile}"
+      openWithSave: "gtkwave ${vcdFile} ${saveFile}"
+    fileExtensions: [".vcd", ".fst", ".gtkw"]
+    errorPatterns: []
