@@ -62,7 +62,7 @@ src/
     openai.ts (243)               # OpenAI-compatible backend (Gemini, DeepSeek, Kimi, Qwen)
                                   #   - Internal streaming for all calls (keep-alive)
                                   #   - Tool call delta accumulation
-                                  #   - 5 attempts with 5/10/15/20s delays
+                                  #   - 3 attempts with 5/10s delays
                                   #   - HTTP/2 fetch with PING keep-alive
     h2-fetch.ts (247)             # HTTP/2 fetch wrapper
                                   #   - PING every 10s (prevents proxy idle disconnect)
@@ -77,7 +77,6 @@ src/
     setup.ts                      # Interactive setup wizard
   project/
     manager.ts                    # Project file structure, design index, filelist management
-    session.ts                    # Session tracking (exists but unused)
   parser/
     hdl-parser.ts                 # Verilog/SV/VHDL parser (modules, ports, instances)
     vcd-parser.ts                 # VCD waveform parser (fallback debug)
@@ -85,11 +84,6 @@ src/
   tools/
     registry.ts                   # EDA tool registry (YAML-based)
     runner.ts                     # EDA tool runner
-  flows/
-    debug-loop.ts                 # Standalone debug loop (unused, orchestrator has inline version)
-    simulation.ts                 # SimulationFlow (unused, app.ts has inline version)
-  orchestrator/
-    workflow.ts                   # Alternate workflow stubs (partially used)
 ```
 
 ## Key Data Flow
@@ -145,7 +139,9 @@ compiles (TB + RTL via design.f), runs independently. PASSED only if all TCs pas
 - All calls use **internal streaming** (even non-streaming `complete()`)
 - **HTTP/2 + PING keep-alive** via h2-fetch.ts (critical for China proxy environments)
 - **Context minimization**: each LLM call gets only the data it needs, no chat history
-- **5 attempts** with 5/10/15/20s retry delays for transient errors
+- **3 attempts** with 5/10s retry delays for transient errors
+- **5-min timeout** per request (streaming keeps connection alive; 5 min silence = dead)
+- **Fallback backend** with sticky switching (once primary fails, stays on fallback)
 - Transient error detection: timeout, ECONNRESET, 499, 5xx, fetch failed, stream closed
 
 ## Logging
@@ -190,10 +186,7 @@ Key settings:
 - `llm.timeoutMs`: 600000 (10 min default)
 - `autoMode`: skip confirmations
 
-## Known Limitations / Dead Code
+## Known Limitations
 
-- `src/flows/debug-loop.ts` — standalone debug loop, unused (orchestrator has inline)
-- `src/flows/simulation.ts` — SimulationFlow class, unused (app.ts has inline)
-- `src/project/session.ts` — session tracking, never imported
-- `src/orchestrator/workflow.ts` — alternate workflow stubs, partially used
-- Dependencies `ink`, `react`, `ora` in package.json — UI uses readline, not ink
+- Cross-module interface change protocol not yet implemented (port changes don't cascade)
+- Per-role model configuration not yet supported (all roles share one model)

@@ -36,6 +36,7 @@ import {
   runArchitectPhase1,
   convertToDesignIndex,
   formatArchitectureSummary,
+  parsePhase1Response,
 } from '../stages/architect-p1.js';
 import { runArchitectPhase2 } from '../stages/architect-p2.js';
 import { writeModule, fixLintErrors, debugFix } from '../stages/rtl-writer.js';
@@ -49,6 +50,7 @@ import { generateDesignParams } from '../stages/design-params-gen.js';
 import { generateTopModule } from '../stages/top-gen.js';
 import {
   buildSTTriageMessages,
+  buildArchitectP1RevisionMessages,
   getRelevantContracts,
 } from './context-builder.js';
 
@@ -1463,6 +1465,9 @@ export class Orchestrator {
 
   // ── ST Triage (v3) ──
 
+  /** Max ST triage → fix → re-test iterations before giving up. */
+  private static readonly ST_TRIAGE_MAX_ROUNDS = 3;
+
   private async *runSTTriage(
     ctx: StageContext,
     stOutput: string,
@@ -1470,45 +1475,172 @@ export class Orchestrator {
   ): AsyncGenerator<OutputChunk> {
     if (!this.phase1Output || !this.designIndex) return;
 
-    yield { type: 'progress', content: 'Triaging system test failure...' };
+    for (let stRound = 0; stRound < Orchestrator.ST_TRIAGE_MAX_ROUNDS; stRound++) {
+      yield { type: 'progress', content: `Triaging system test failure (round ${stRound + 1})...` };
 
-    // Read top module code
-    const topModuleName = this.designIndex.topModules[0] ?? 'top';
-    let topModuleCode = '';
-    try {
-      topModuleCode = await ctx.readFile(`hw/src/hdl/${topModuleName}.sv`);
-    } catch {
+      // Read top module code
+      const topModuleName = this.designIndex.topModules[0] ?? 'top';
+      let topModuleCode = '';
       try {
-        topModuleCode = await ctx.readFile(`hw/src/hdl/${topModuleName}.v`);
+        topModuleCode = await ctx.readFile(`hw/src/hdl/${topModuleName}.sv`);
       } catch {
-        topModuleCode = '(top module code not available)';
-      }
-    }
-
-    const subModulePorts: Array<{ name: string; ports: PortDef[] }> =
-      this.designIndex.modules.map(m => ({ name: m.name, ports: m.ports }));
-
-    const messages = buildSTTriageMessages(stOutput, topModuleCode, subModulePorts);
-    const response = await ctx.llm.complete(messages, { temperature: 0.2 });
-
-    // Parse triage result
-    try {
-      const text = response.content;
-      const jsonMatch = text.match(/\{[\s\S]*?"fix_location"[\s\S]*?\}/);
-      if (jsonMatch) {
-        const triage = JSON.parse(jsonMatch[0]) as STTriageDiagnosis;
-        yield { type: 'status', content: `ST triage: ${triage.fix_location} — ${triage.diagnosis}` };
-
-        if (triage.fix_location === 'module' && triage.module_name) {
-          yield { type: 'status', content: `Failure localized to module "${triage.module_name}". Re-enter module debug loop.` };
-        } else if (triage.fix_location === 'connection') {
-          yield { type: 'status', content: 'Failure in inter-module connections. P1 architecture revision may be needed.' };
-        } else {
-          yield { type: 'status', content: 'Cannot determine failure source. VCD fallback recommended.' };
+        try {
+          topModuleCode = await ctx.readFile(`hw/src/hdl/${topModuleName}.v`);
+        } catch {
+          topModuleCode = '(top module code not available)';
         }
       }
-    } catch {
-      yield { type: 'status', content: 'ST triage parse failed. Manual investigation needed.' };
+
+      const subModulePorts: Array<{ name: string; ports: PortDef[] }> =
+        this.designIndex.modules.map(m => ({ name: m.name, ports: m.ports }));
+
+      const messages = buildSTTriageMessages(stOutput, topModuleCode, subModulePorts);
+      const response = await ctx.llm.complete(messages, { temperature: 0.2 });
+
+      // Parse triage result
+      let triage: STTriageDiagnosis | null = null;
+      try {
+        const text = response.content;
+        const jsonMatch = text.match(/\{[\s\S]*?"fix_location"[\s\S]*?\}/);
+        if (jsonMatch) {
+          triage = JSON.parse(jsonMatch[0]) as STTriageDiagnosis;
+        }
+      } catch { /* parse failed */ }
+
+      if (!triage) {
+        yield { type: 'status', content: 'ST triage parse failed. Manual investigation needed.' };
+        return;
+      }
+
+      yield { type: 'status', content: `ST triage: ${triage.fix_location} — ${triage.diagnosis}` };
+
+      // ── Route A: sub-module logic issue → enter that module's debug loop ──
+      if (triage.fix_location === 'module' && triage.module_name) {
+        const mod = this.workflowState?.moduleStatuses.find(m => m.name === triage!.module_name);
+        if (!mod) {
+          yield { type: 'status', content: `Module "${triage.module_name}" not found in module list.` };
+          return;
+        }
+
+        yield { type: 'status', content: `Entering debug loop for module "${mod.name}"...` };
+        // Reset debug counters for the ST-triggered debug round
+        mod.sameErrorRetries = 0;
+        mod.totalIterations = 0;
+        mod.status = 'testing';
+        yield* this.debugLoop(mod, stOutput, context);
+
+        if ((mod.status as string) !== 'done') {
+          yield { type: 'status', content: `Debug loop for "${mod.name}" did not resolve. Manual intervention needed.` };
+          return;
+        }
+
+        // Module fixed — re-run ST to check
+        yield { type: 'status', content: 'Module fixed. Re-running system test...' };
+        const reSimResult = await this.rerunST(context);
+        if (!reSimResult) return; // sim tool unavailable
+        if (reSimResult.includes('TEST PASSED') || reSimResult.includes('PASSED')) {
+          yield { type: 'status', content: 'System test PASSED after fix.' };
+          return;
+        }
+        // Still failing — loop back to triage with new output
+        stOutput = reSimResult;
+        yield { type: 'status', content: 'System test still failing after module fix. Re-triaging...' };
+        continue;
+      }
+
+      // ── Route B: connection/contract issue → P1 revision → re-generate top → re-ST ──
+      if (triage.fix_location === 'connection') {
+        yield { type: 'status', content: 'Connection issue detected. Revising P1 architecture...' };
+
+        const oldP1 = this.phase1Output;
+        const revisionFeedback = `System test failure due to connection issue: ${triage.diagnosis}. Fix the interface contracts and/or module connections accordingly.`;
+
+        // Use architect-p1 revision to fix contracts
+        const prevJSON = JSON.stringify(oldP1, null, 2);
+        const revisionMessages = buildArchitectP1RevisionMessages(prevJSON, revisionFeedback);
+        const revResponse = await ctx.llm.complete(revisionMessages, { temperature: 0.3 });
+
+        let newP1: ArchitectPhase1Output | null = null;
+        try {
+          newP1 = parsePhase1Response(revResponse);
+        } catch {
+          yield { type: 'status', content: 'Failed to parse revised P1. Manual intervention needed.' };
+          return;
+        }
+
+        // Apply incremental rebuild
+        const diff = this.diffPhase1(oldP1, newP1);
+        yield { type: 'status', content: `P1 revised: ${diff.unchanged.length} unchanged, ${diff.changed.length} changed, ${diff.added.length} added, ${diff.removed.length} removed` };
+        this.phase1Output = newP1;
+        this.designIndex = convertToDesignIndex(newP1);
+        context.designIndex = this.designIndex;
+        this.applyIncrementalRebuild(diff, newP1);
+
+        // Re-generate design_params if needed
+        if (diff.globalParamsChanged) {
+          for await (const chunk of generateDesignParams(ctx, newP1, context.hdlStandard)) {
+            yield chunk;
+          }
+        }
+
+        // Re-generate top module
+        if (newP1.topPorts?.length) {
+          for (const topName of newP1.topModules) {
+            for await (const chunk of generateTopModule(ctx, newP1, topName, context.hdlStandard)) {
+              yield chunk;
+            }
+          }
+        }
+
+        // Re-run any changed/added modules through RTL pipeline
+        const pendingMods = this.workflowState?.moduleStatuses.filter(m => m.status === 'pending') ?? [];
+        if (pendingMods.length > 0) {
+          yield { type: 'status', content: `Re-building ${pendingMods.length} affected module(s)...` };
+          yield* this.runRTLPipeline(context);
+        }
+
+        // Re-run ST
+        yield { type: 'status', content: 'Re-running system test after P1 revision...' };
+        const reSimResult = await this.rerunST(context);
+        if (!reSimResult) return;
+        if (reSimResult.includes('TEST PASSED') || reSimResult.includes('PASSED')) {
+          yield { type: 'status', content: 'System test PASSED after P1 revision.' };
+          return;
+        }
+        stOutput = reSimResult;
+        yield { type: 'status', content: 'System test still failing after P1 revision. Re-triaging...' };
+        continue;
+      }
+
+      // ── Route C: unknown → VCD fallback ──
+      yield { type: 'status', content: 'Cannot determine failure source. Adding VCD dump for signal tracing...' };
+      const topModName = this.designIndex.topModules[0] ?? 'top';
+      await addVCDToTB(ctx, topModName, []);
+      const vcdSimResult = await this.rerunST(context);
+      if (!vcdSimResult) return;
+      if (vcdSimResult.includes('TEST PASSED') || vcdSimResult.includes('PASSED')) {
+        yield { type: 'status', content: 'System test PASSED (unexpected after VCD add).' };
+        return;
+      }
+      // Feed VCD-enriched output back into triage for a more informed diagnosis
+      stOutput = vcdSimResult;
+      yield { type: 'status', content: 'VCD captured. Re-triaging with waveform data...' };
+      continue;
+    }
+
+    yield { type: 'status', content: `ST triage exhausted after ${Orchestrator.ST_TRIAGE_MAX_ROUNDS} rounds. Manual intervention needed.` };
+  }
+
+  /** Re-run system test simulation and return output, or null if tool unavailable. */
+  private async rerunST(context: OrchestratorContext): Promise<string | null> {
+    if (!context.executeAction) return null;
+    try {
+      return await context.executeAction({
+        type: 'runSimulation',
+        payload: { testType: 'st' },
+      });
+    } catch (err) {
+      return `Simulation error: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 

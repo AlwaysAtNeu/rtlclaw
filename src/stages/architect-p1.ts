@@ -275,7 +275,7 @@ function parseRequirementsAnalysis(response: LLMResponse): RequirementsAnalysis 
 // Parse LLM response (function-call path + text fallback)
 // ---------------------------------------------------------------------------
 
-function parsePhase1Response(response: LLMResponse): ArchitectPhase1Output {
+export function parsePhase1Response(response: LLMResponse): ArchitectPhase1Output {
   // Path 1: function calling — tool_calls with submit_architecture
   if (response.toolCalls.length > 0) {
     const call = response.toolCalls.find((tc) => tc.name === 'submit_architecture');
