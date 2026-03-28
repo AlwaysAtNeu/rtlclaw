@@ -530,6 +530,22 @@ export class Orchestrator {
 
         break; // No tool calls, done
       }
+
+      // If we used tools but LLM never gave a text summary, force one
+      if (!fullContent.trim() && messages.some(m => m.role === 'tool')) {
+        messages.push({
+          role: 'user',
+          content: 'Please summarize what you did and what you found.',
+        });
+        const finalResp = await this.backend.complete(messages, {
+          temperature: 0.3,
+          signal: context.signal,
+        });
+        if (finalResp.content) {
+          fullContent += finalResp.content;
+          yield { type: 'text', content: finalResp.content };
+        }
+      }
     } catch (err) {
       // Don't show error for user-initiated abort (Ctrl+C)
       if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
