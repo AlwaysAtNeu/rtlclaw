@@ -43,6 +43,8 @@ export interface RunOptions {
   onStderr?: (line: string) => void;
   /** Error patterns to use for parsing output */
   errorPatterns?: ErrorPattern[];
+  /** Abort signal for cancelling the command (e.g. Ctrl+C) */
+  signal?: AbortSignal;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +88,23 @@ export class CommandRunner {
             try { child.kill('SIGKILL'); } catch { /* already dead */ }
           }, 5000);
         }, opts.timeoutMs);
+      }
+
+      // Handle abort signal (Ctrl+C)
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          child.kill('SIGTERM');
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+          return;
+        }
+        const onAbort = () => {
+          child.kill('SIGTERM');
+          setTimeout(() => {
+            try { child.kill('SIGKILL'); } catch { /* already dead */ }
+          }, 2000);
+        };
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+        child.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
       }
 
       child.stdout.on('data', (data: Buffer) => {

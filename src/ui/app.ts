@@ -11,6 +11,7 @@ import * as readline from 'node:readline';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import chalk from 'chalk';
 import type { ConfigManager } from '../config/manager.js';
 import type { LLMBackend } from '../llm/base.js';
@@ -24,23 +25,137 @@ import {
 import type { Action, DesignIndex, WorkflowState } from '../agents/types.js';
 
 // --------------------------------------------------------------------------
+// Async exec with abort support (replaces execSync to unblock event loop)
+// --------------------------------------------------------------------------
+
+interface ExecAsyncOptions {
+  cwd?: string;
+  encoding?: BufferEncoding;
+  timeout?: number;
+  shell?: string;
+  signal?: AbortSignal;
+}
+
+function execAsync(cmd: string, opts: ExecAsyncOptions = {}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-c', cmd], {
+      cwd: opts.cwd ?? process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: opts.shell,
+    });
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    child.stdout.on('data', (d: Buffer) => stdoutChunks.push(d.toString()));
+    child.stderr.on('data', (d: Buffer) => stderrChunks.push(d.toString()));
+
+    // Timeout
+    let timedOut = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    if (opts.timeout && opts.timeout > 0) {
+      timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 3000);
+      }, opts.timeout);
+    }
+
+    // Abort signal (Ctrl+C)
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        child.kill('SIGTERM');
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+        return;
+      }
+      const onAbort = () => {
+        child.kill('SIGTERM');
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000);
+      };
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+      child.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
+    }
+
+    child.on('error', (err) => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      const stdout = stdoutChunks.join('');
+      const stderr = stderrChunks.join('');
+
+      // Check if aborted
+      if (opts.signal?.aborted) {
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+        return;
+      }
+
+      if (timedOut) {
+        const err: any = new Error(`Command timed out after ${opts.timeout}ms`);
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+        return;
+      }
+
+      if (code !== 0) {
+        const err: any = new Error(`Command failed with exit code ${code}`);
+        err.stdout = stdout;
+        err.stderr = stderr;
+        err.status = code;
+        reject(err);
+        return;
+      }
+
+      resolve(stdout);
+    });
+  });
+}
+
+// --------------------------------------------------------------------------
 // Display helpers
 // --------------------------------------------------------------------------
 
 const COLS = () => Math.min(process.stdout.columns || 80, 80);
 const DIVIDER = () => chalk.dim('\u2500'.repeat(COLS()));
 
+// Gradient helper: blend through cyan → blue → magenta across characters
+const GRADIENT_COLORS = [
+  chalk.hex('#00FFFF'), // cyan
+  chalk.hex('#00DDFF'),
+  chalk.hex('#00BBFF'),
+  chalk.hex('#0099FF'),
+  chalk.hex('#3377FF'), // blue
+  chalk.hex('#6655FF'),
+  chalk.hex('#9944FF'),
+  chalk.hex('#CC33FF'),
+  chalk.hex('#FF22DD'), // magenta
+];
+
+function gradientText(text: string): string {
+  const chars = [...text];
+  return chars.map((ch, i) => {
+    const colorIdx = Math.floor((i / Math.max(chars.length - 1, 1)) * (GRADIENT_COLORS.length - 1));
+    return GRADIENT_COLORS[colorIdx]!(ch);
+  }).join('');
+}
+
 function printHeader(): void {
-  const W = 44; // inner width
-  const top    = '\u256D' + '\u2500'.repeat(W) + '\u256E';
-  const line1  = '\u2502' + '  RTL-Claw v0.1.0'.padEnd(W) + '\u2502';
-  const line2  = '\u2502' + '  AI-Powered RTL Development Assistant'.padEnd(W) + '\u2502';
-  const bottom = '\u2570' + '\u2500'.repeat(W) + '\u256F';
+  const logo = [
+    '  ____  _____ _           ____  _               ',
+    ' |  _ \\|_   _| |         / ___|| | __ ___      __',
+    ' | |_) | | | | |  _____ | |   | |/ _` \\ \\ /\\ / /',
+    ' |  _ <  | | | |_|_____|| |___| | (_| |\\ V  V / ',
+    ' |_| \\_\\ |_| |_____|     \\____|_|\\__,_| \\_/\\_/  ',
+  ];
   console.log();
-  console.log(chalk.cyan.bold('  ' + top));
-  console.log(chalk.cyan.bold('  ' + line1));
-  console.log(chalk.dim('  ' + line2));
-  console.log(chalk.cyan.bold('  ' + bottom));
+  for (const line of logo) {
+    console.log('  ' + gradientText(line));
+  }
+  console.log();
+  console.log(chalk.dim('  ') + chalk.bold.white('v0.1.0') + chalk.dim('  \u2502  AI-Powered RTL Development Assistant'));
+  console.log(chalk.dim('  ' + '\u2500'.repeat(50)));
   console.log();
 }
 
@@ -50,33 +165,88 @@ function printSystem(text: string): void {
 
 function printUser(text: string): void {
   console.log(DIVIDER());
-  console.log(chalk.green.bold('  You: ') + text);
+  console.log(chalk.green.bold('  \u276F You: ') + text);
   console.log();
+}
+
+function buildPrompt(projectMode: boolean, projectName?: string, modelName?: string): string {
+  const modelTag = modelName ? chalk.dim(`[${modelName}]`) + ' ' : '';
+  if (projectMode && projectName) {
+    return `  ${modelTag}${chalk.hex('#9944FF').bold(projectName)} ${chalk.hex('#9944FF').bold('\u276F')} `;
+  }
+  return `  ${modelTag}${chalk.cyan.bold('\u276F')} `;
 }
 
 function printError(text: string): void {
-  console.log(chalk.red('  Error: ') + text);
+  console.log(chalk.red('  \u2718 Error: ') + text);
   console.log();
 }
 
+function printResult(text: string): void {
+  // Highlight PASSED/FAILED keywords in simulation output
+  const highlighted = text
+    .replace(/\bTEST PASSED\b|\bPASSED\b|\bSUCCESS\b|\bALL TESTS PASSED\b/g,
+      (m) => chalk.bgGreen.black.bold(` ${m} `))
+    .replace(/\bTEST FAILED\b|\bFAILED\b/g,
+      (m) => chalk.bgRed.white.bold(` ${m} `))
+    .replace(/\bERROR:/g,
+      chalk.red.bold('ERROR:'));
+  console.log('  ' + highlighted);
+}
+
+function printCodeBlock(content: string, lang?: string): void {
+  const label = lang ? chalk.dim(` ${lang} `) : '';
+  const border = chalk.dim('\u2502');
+  console.log(chalk.dim('  \u250C\u2500') + label + chalk.dim('\u2500'.repeat(Math.max(0, 40 - (lang?.length ?? 0)))));
+  for (const line of content.split('\n')) {
+    console.log(chalk.dim('  ') + border + '  ' + line);
+  }
+  console.log(chalk.dim('  \u2514' + '\u2500'.repeat(42)));
+  console.log();
+}
+
+function printDebugRound(round: number, total: number, message: string): void {
+  const badge = chalk.bgYellow.black.bold(` Debug ${round}/${total} `);
+  console.log(`  ${badge} ${chalk.yellow(message)}`);
+}
+
+function printProgressBar(current: number, total: number, label: string, stage?: string): void {
+  const barWidth = 20;
+  const filled = Math.round((current / total) * barWidth);
+  const empty = barWidth - filled;
+  const bar = chalk.hex('#00BBFF')('\u2588'.repeat(filled)) + chalk.dim('\u2591'.repeat(empty));
+  const pct = chalk.bold(`${current}/${total}`);
+  const stageTag = stage ? chalk.hex('#9944FF').bold(` ${stage}`) : '';
+  console.log(`  ${bar} ${pct}  ${chalk.white(label)}${stageTag}`);
+}
+
 function printHelp(): void {
+  const cmd = (name: string, desc: string) =>
+    chalk.cyan(`    ${name.padEnd(22)}`) + chalk.dim(`\u2014 ${desc}`);
+
   console.log([
     '',
-    chalk.bold('  Commands:'),
-    chalk.cyan('    /help              ') + chalk.dim('\u2014 Show this help'),
-    chalk.cyan('    /project list      ') + chalk.dim('\u2014 List known projects'),
-    chalk.cyan('    /project open <p>  ') + chalk.dim('\u2014 Open project (enter Project Mode)'),
-    chalk.cyan('    /project init <n>  ') + chalk.dim('\u2014 Create new project'),
-    chalk.cyan('    /project close     ') + chalk.dim('\u2014 Close project (return to Claw Mode)'),
-    chalk.cyan('    /model <name>      ') + chalk.dim('\u2014 Switch LLM model'),
-    chalk.cyan('    /provider <name>   ') + chalk.dim('\u2014 Switch LLM provider'),
-    chalk.cyan('    /auto              ') + chalk.dim('\u2014 Toggle auto mode'),
-    chalk.cyan('    /config            ') + chalk.dim('\u2014 Show current config'),
-    chalk.cyan('    /tools             ') + chalk.dim('\u2014 Show EDA tool status'),
-    chalk.cyan('    /continue          ') + chalk.dim('\u2014 Resume paused workflow'),
-    chalk.cyan('    /log               ') + chalk.dim('\u2014 Show recent log entries'),
-    chalk.cyan('    /clear             ') + chalk.dim('\u2014 Clear conversation history'),
-    chalk.cyan('    /quit              ') + chalk.dim('\u2014 Exit'),
+    chalk.bold.hex('#00BBFF')('  \u25B8 Project'),
+    cmd('/project init <n>', 'Create new project'),
+    cmd('/project open <p>', 'Open project (Project Mode)'),
+    cmd('/project list', 'List known projects'),
+    cmd('/project close', 'Return to Claw Mode'),
+    '',
+    chalk.bold.hex('#9944FF')('  \u25B8 Model'),
+    cmd('/model', 'Show or switch model'),
+    cmd('/provider <name>', 'Switch LLM provider'),
+    cmd('/config', 'Show current config'),
+    '',
+    chalk.bold.hex('#FF22DD')('  \u25B8 Workflow'),
+    cmd('/continue', 'Resume paused workflow'),
+    cmd('/auto', 'Toggle auto mode'),
+    cmd('/tools', 'Show EDA tool status'),
+    cmd('/log', 'Show recent log entries'),
+    '',
+    chalk.bold.white('  \u25B8 General'),
+    cmd('/help', 'Show this help'),
+    cmd('/clear', 'Clear conversation'),
+    cmd('/quit', 'Exit'),
     '',
   ].join('\n'));
 }
@@ -136,6 +306,7 @@ async function executeAction(
   projectPath: string | undefined,
   hdlStandard?: string,
   logTrace?: (entry: LLMTraceEntry) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<string> {
   const baseDir = projectPath ?? process.cwd();
 
@@ -183,8 +354,7 @@ async function executeAction(
 
     case 'runCommand': {
       const payload = action.payload as { command: string };
-      const { execSync } = await import('node:child_process');
-      const output = execSync(payload.command, { cwd: baseDir, encoding: 'utf-8', timeout: 60_000 });
+      const output = await execAsync(payload.command, { cwd: baseDir, timeout: 60_000, signal });
       return output;
     }
 
@@ -194,27 +364,29 @@ async function executeAction(
       const iverilogGen = hdlStandardToIverilogGen(hdlStandard);
       if (!existsSync(filePath)) return `  Lint: file not found ${payload.file}`;
 
-      const { execSync } = await import('node:child_process');
       const envPrefix = buildSetenvPrefix(baseDir);
       const lintStartMs = Date.now();
       let lintCmd = '';
       let lintResult = '';
+
+      // Use filelist for dependencies and include paths if available
+      const filelistPath = path.join(baseDir, 'hw/src/filelist/design.f');
+      const filelistArg = existsSync(filelistPath) ? ` -f ${filelistPath}` : '';
+
       try {
-        execSync(`which verilator`, { encoding: 'utf-8' });
-        lintCmd = `${envPrefix}verilator --lint-only -Wall ${filePath} 2>&1 || true`;
-        lintResult = execSync(lintCmd, {
-          cwd: baseDir, encoding: 'utf-8', timeout: 30_000, shell: '/bin/bash',
-        });
+        await execAsync('which verilator', { signal });
+        lintCmd = `${envPrefix}verilator --lint-only -Wall${filelistArg} ${filePath} 2>&1 || true`;
+        lintResult = await execAsync(lintCmd, { cwd: baseDir, timeout: 30_000, signal });
         lintResult = lintResult || '  Lint: passed';
-      } catch {
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
         try {
-          execSync(`which iverilog`, { encoding: 'utf-8' });
-          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull ${filePath} 2>&1 || true`;
-          lintResult = execSync(lintCmd, {
-            cwd: baseDir, encoding: 'utf-8', timeout: 30_000, shell: '/bin/bash',
-          });
+          await execAsync('which iverilog', { signal });
+          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull${filelistArg} ${filePath} 2>&1 || true`;
+          lintResult = await execAsync(lintCmd, { cwd: baseDir, timeout: 30_000, signal });
           lintResult = lintResult || '  Lint: passed';
-        } catch {
+        } catch (e2) {
+          if (e2 instanceof DOMException && e2.name === 'AbortError') throw e2;
           throw new Error('No lint tool available (verilator or iverilog)');
         }
       }
@@ -234,8 +406,7 @@ async function executeAction(
     }
 
     case 'runSimulation': {
-      const payload = action.payload as { module?: string; testType: 'ut' | 'st' };
-      const { execSync } = await import('node:child_process');
+      const payload = action.payload as { module?: string; testType: 'ut' | 'st'; tc?: string };
       const iverilogGen = hdlStandardToIverilogGen(hdlStandard);
 
       // Find testbench and sources
@@ -288,21 +459,28 @@ async function executeAction(
       const usesTcInclude = tbContent.includes('PLACEHOLDER_TC');
 
       try {
-        execSync(`which iverilog`, { encoding: 'utf-8' });
-      } catch {
+        await execAsync('which iverilog', { signal });
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
         throw new Error('Simulation tool (iverilog) not available');
       }
 
       if (usesTcInclude && tcFiles.length > 0) {
         // ── TB/TC separated via `include ──
+        // If a specific TC is requested, only run that one
+        const tcsToRun = payload.tc
+          ? tcFiles.filter(f => f === payload.tc || f.includes(payload.tc!))
+          : tcFiles;
+
         const allResults: string[] = [];
         let allPassed = true;
 
-        for (const tcFile of tcFiles) {
+        for (const tcFile of tcsToRun) {
           const tcFilePath = path.join(tcPath, tcFile);
-          const tcRelPath = path.relative(tbPath, tcFilePath);
-          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcRelPath}"`);
           const tempTBPath = path.join(simDir, `tb_temp_${tcFile}`);
+          // Calculate TC path relative to where the temp TB file will be (simDir)
+          const tcRelPath = path.relative(simDir, tcFilePath);
+          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcRelPath}"`);
           await fs.writeFile(tempTBPath, tempTBContent, 'utf-8');
 
           const vvpPath = path.join(simDir, `sim_${tcFile.replace(/\.\w+$/, '')}.vvp`);
@@ -313,13 +491,14 @@ async function executeAction(
           let tcPassed = false;
 
           try {
-            execSync(compileCmd, { cwd: baseDir, encoding: 'utf-8', timeout: 60_000, shell: '/bin/bash' });
-            const simOutput = execSync(runCmd, { cwd: simDir, encoding: 'utf-8', timeout: 120_000, shell: '/bin/bash' });
+            await execAsync(compileCmd, { cwd: baseDir, timeout: 60_000, signal });
+            const simOutput = await execAsync(runCmd, { cwd: simDir, timeout: 120_000, signal });
             tcPassed = simOutput.includes('TEST PASSED') || simOutput.includes('PASSED');
             tcOutput = simOutput;
             if (!tcPassed) allPassed = false;
             allResults.push(`=== ${tcFile} ===\n${simOutput}`);
           } catch (err) {
+            if (err instanceof DOMException && err.name === 'AbortError') throw err;
             allPassed = false;
             if (err instanceof Error && 'stdout' in err) {
               const execErr = err as { stdout?: string; stderr?: string };
@@ -342,6 +521,12 @@ async function executeAction(
               responseContent: `$ ${compileCmd}\n$ ${runCmd}\n\n${tcOutput}`,
             });
           }
+
+          // Stop at first failure — report which TC failed so debug loop can target it
+          if (!tcPassed) {
+            allResults.push(`FAILING_TC: ${tcFile}`);
+            break;
+          }
         }
 
         const combined = allResults.join('\n');
@@ -355,15 +540,13 @@ async function executeAction(
         let simOutput = '';
         let simPassed = false;
         try {
-          execSync(compileCmd, { cwd: baseDir, encoding: 'utf-8', timeout: 60_000, shell: '/bin/bash' });
-          simOutput = execSync(runCmd,
-            { cwd: simDir, encoding: 'utf-8', timeout: 120_000, shell: '/bin/bash' },
-          );
+          await execAsync(compileCmd, { cwd: baseDir, timeout: 60_000, signal });
+          simOutput = await execAsync(runCmd, { cwd: simDir, timeout: 120_000, signal });
           simPassed = simOutput.includes('TEST PASSED') || simOutput.includes('PASSED');
         } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') throw err;
           if (err instanceof Error && 'stdout' in err) {
             const execErr = err as { stdout?: string; stderr?: string };
-            // stdout may be empty string when stderr has the errors (even with 2>&1)
             simOutput = (execErr.stdout || execErr.stderr || err.message);
           } else {
             simOutput = err instanceof Error ? err.message : String(err);
@@ -439,11 +622,10 @@ async function executeAction(
     }
 
     case 'synthesize': {
-      const { execSync } = await import('node:child_process');
       const envPrefix = buildSetenvPrefix(baseDir);
       const synPayload = action.payload as { topModule?: string };
       try {
-        execSync(`which yosys`, { encoding: 'utf-8' });
+        await execAsync('which yosys', { signal });
         const synDir = path.join(baseDir, 'hw/syn');
         await fs.mkdir(synDir, { recursive: true });
 
@@ -456,11 +638,12 @@ async function executeAction(
           await fs.writeFile(ysPath, ysScript, 'utf-8');
         }
 
-        const result = execSync(`${envPrefix}yosys -s ${ysPath} 2>&1 || true`, {
-          cwd: synDir, encoding: 'utf-8', timeout: 300_000, shell: '/bin/bash',
+        const result = await execAsync(`${envPrefix}yosys -s ${ysPath} 2>&1 || true`, {
+          cwd: synDir, timeout: 300_000, signal,
         });
         return result;
-      } catch {
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') throw e;
         throw new Error('Synthesis tool (yosys) not available');
       }
     }
@@ -597,14 +780,13 @@ async function writeLLMTrace(projectPath: string, entry: LLMTraceEntry): Promise
 // --------------------------------------------------------------------------
 
 async function checkEdaTools(): Promise<{ available: string[]; missing: string[] }> {
-  const { execSync } = await import('node:child_process');
   const tools = ['iverilog', 'verilator', 'yosys', 'vcs', 'vivado'];
   const available: string[] = [];
   const missing: string[] = [];
 
   for (const tool of tools) {
     try {
-      execSync(`which ${tool}`, { encoding: 'utf-8' });
+      await execAsync(`which ${tool}`);
       available.push(tool);
     } catch {
       missing.push(tool);
@@ -612,6 +794,58 @@ async function checkEdaTools(): Promise<{ available: string[]; missing: string[]
   }
 
   return { available, missing };
+}
+
+// --------------------------------------------------------------------------
+// Command definitions (used for both completion and help)
+// --------------------------------------------------------------------------
+
+interface CommandDef {
+  name: string;
+  args?: string;
+  description: string;
+  subcommands?: CommandDef[];
+}
+
+const COMMANDS: CommandDef[] = [
+  {
+    name: '/project', args: '<action>', description: 'Manage projects',
+    subcommands: [
+      { name: '/project init', args: '<name>', description: 'Create new project' },
+      { name: '/project open', args: '<path>', description: 'Open project' },
+      { name: '/project list', description: 'List projects' },
+      { name: '/project close', description: 'Close project' },
+    ],
+  },
+  { name: '/model', args: '[name]', description: 'Show or switch model' },
+  { name: '/provider', args: '<name>', description: 'Switch LLM provider' },
+  { name: '/config', description: 'Show current config' },
+  { name: '/continue', description: 'Resume paused workflow' },
+  { name: '/auto', description: 'Toggle auto mode' },
+  { name: '/tools', description: 'Show EDA tool status' },
+  { name: '/log', description: 'Show recent log entries' },
+  { name: '/help', description: 'Show help' },
+  { name: '/clear', description: 'Clear conversation' },
+  { name: '/quit', description: 'Exit' },
+];
+
+function getCompletions(line: string): [string[], string] {
+  const trimmed = line.trimStart();
+  if (!trimmed.startsWith('/')) return [[], trimmed];
+
+  // Collect all completable command strings (including subcommands)
+  const allCmds: string[] = [];
+  for (const cmd of COMMANDS) {
+    allCmds.push(cmd.name);
+    if (cmd.subcommands) {
+      for (const sub of cmd.subcommands) {
+        allCmds.push(sub.name);
+      }
+    }
+  }
+
+  const matches = allCmds.filter(c => c.startsWith(trimmed));
+  return [matches, trimmed];
 }
 
 // --------------------------------------------------------------------------
@@ -650,14 +884,27 @@ async function handleCommand(
       config.set('autoMode', !config.config.autoMode);
       printSystem(`Auto mode: ${config.config.autoMode ? 'ON' : 'OFF'}`);
       return {};
-    case '/model':
+    case '/model': {
       if (parts[1]) {
         config.setLLM({ model: parts[1] });
-        printSystem(`Model switched to: ${parts[1]}`);
+        printSystem(`Model switched to: ${chalk.cyan(parts[1])}`);
         return { recreateBackend: true };
       }
-      printSystem(`Current model: ${config.llm.provider}/${config.llm.model}`);
+      // Show available models for current provider
+      const { PROVIDER_MODELS } = await import('../llm/factory.js');
+      const models = PROVIDER_MODELS[config.llm.provider] ?? [];
+      const current = config.llm.model;
+      printSystem(`Provider: ${chalk.cyan(config.llm.provider)}  Model: ${chalk.cyan.bold(current)}`);
+      if (models.length > 0) {
+        console.log(chalk.dim('  Available models:'));
+        for (const m of models) {
+          const marker = m === current ? chalk.green(' \u25CF') : chalk.dim(' \u25CB');
+          console.log(`  ${marker} ${m === current ? chalk.bold(m) : m}`);
+        }
+        console.log(chalk.dim('  Use: /model <name> to switch\n'));
+      }
       return {};
+    }
     case '/provider':
       if (parts[1]) {
         config.setLLM({ provider: parts[1] as import('../config/schema.js').LLMProvider });
@@ -741,13 +988,11 @@ async function handleProjectCommand(parts: string[]): Promise<CommandResult> {
       if (!arg) { printSystem('Usage: /project open <path>'); return {}; }
       try {
         // Check EDA tools
-        const { available, missing } = await checkEdaTools();
+        const { available } = await checkEdaTools();
         if (available.length === 0) {
           printSystem(chalk.yellow('Warning: No EDA tools found. Install iverilog or verilator for lint/simulation.'));
-          printSystem(chalk.dim('  Ubuntu/Debian: sudo apt install iverilog verilator'));
-          printSystem(chalk.dim('  macOS: brew install icarus-verilog verilator'));
-        } else if (missing.length > 0) {
-          printSystem(`EDA tools: ${chalk.green(available.join(', '))} available, ${chalk.dim(missing.join(', '))} not found`);
+        } else {
+          printSystem(`EDA: ${available.map(t => chalk.green(t)).join(chalk.dim(', '))}`);
         }
 
         const info = await pm.openProject(arg);
@@ -772,10 +1017,9 @@ async function handleProjectCommand(parts: string[]): Promise<CommandResult> {
       const rootPath = path.isAbsolute(name) ? name : path.join(process.cwd(), name);
 
       // Check EDA tools
-      const { available, missing } = await checkEdaTools();
+      const { available } = await checkEdaTools();
       if (available.length === 0) {
-        printSystem(chalk.yellow('Warning: No EDA tools found.'));
-        printSystem(chalk.dim('  Install iverilog: sudo apt install iverilog'));
+        printSystem(chalk.yellow('Warning: No EDA tools found. Install iverilog or verilator for lint/simulation.'));
       }
 
       try {
@@ -825,7 +1069,21 @@ async function processOrchestratorOutput(
           spinner.start(chunk.content);
         } else {
           spinner.stop();
-          console.log(chalk.dim('  ' + chunk.content));
+          // Detect workflow progress patterns like "[2/5] Stage: module_name"
+          const progressMatch = chunk.content.match(/\[(\d+)\/(\d+)\]\s*(.*)/);
+          if (progressMatch) {
+            const cur = parseInt(progressMatch[1]!);
+            const tot = parseInt(progressMatch[2]!);
+            const rest = progressMatch[3]!;
+            const stageMatch = rest.match(/^(\w[\w\s]*?):\s*(.+)/);
+            if (stageMatch) {
+              printProgressBar(cur, tot, stageMatch[2]!, stageMatch[1]);
+            } else {
+              printProgressBar(cur, tot, rest);
+            }
+          } else {
+            console.log(chalk.dim('  ' + chunk.content));
+          }
         }
         break;
 
@@ -862,7 +1120,19 @@ async function processOrchestratorOutput(
           console.log('\n');
           isStreaming = false;
         }
-        console.log(chalk.dim('  ' + chunk.content));
+        // Highlight simulation results in status messages
+        if (/PASSED|FAILED|ERROR:/i.test(chunk.content)) {
+          printResult(chunk.content);
+        } else if (/Debug round|debug loop/i.test(chunk.content)) {
+          const roundMatch = chunk.content.match(/(\d+)\s*\/\s*(\d+)/);
+          if (roundMatch) {
+            printDebugRound(parseInt(roundMatch[1]!), parseInt(roundMatch[2]!), chunk.content);
+          } else {
+            console.log(chalk.yellow('  \u25B6 ') + chalk.dim(chunk.content));
+          }
+        } else {
+          console.log(chalk.dim('  ' + chunk.content));
+        }
         break;
 
       case 'code':
@@ -871,11 +1141,7 @@ async function processOrchestratorOutput(
           console.log('\n');
           isStreaming = false;
         }
-        console.log(chalk.magenta('  [Code Block]'));
-        for (const line of chunk.content.split('\n')) {
-          console.log('    ' + line);
-        }
-        console.log();
+        printCodeBlock(chunk.content, (chunk.metadata?.lang as string) ?? undefined);
         break;
 
       case 'confirm':
@@ -976,13 +1242,16 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: chalk.green.bold('  > '),
+    prompt: buildPrompt(false, undefined, configManager.llm.model),
     terminal: true,
+    completer: (line: string) => getCompletions(line),
   });
 
   let rlClosed = false;
   // AbortController for cancelling in-flight LLM requests on Ctrl+C
   let currentAbort: AbortController | null = null;
+  // Track whether SIGINT already handled the prompt restoration for the current operation
+  let sigintHandled = false;
 
   // Handle Ctrl+C: if busy (LLM/sim running), abort current operation and return to prompt.
   // If idle (waiting for input), exit the process.
@@ -994,8 +1263,9 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
         currentAbort.abort();
         currentAbort = null;
       }
-      console.log(chalk.yellow('\n  ⚠ Operation cancelled (Ctrl+C)'));
+      console.log(chalk.yellow('\n  \u26A0 Operation cancelled (Ctrl+C)'));
       busy = false;
+      sigintHandled = true;
       if (!rlClosed) {
         rl.resume();
         rl.prompt();
@@ -1046,13 +1316,23 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       currentProjectName = info.name;
       projectMode = true;
       printSystem(`Project: ${chalk.bold(info.name)} (${info.rootPath})`);
-      printSystem(`Mode: ${chalk.cyan('Project Mode')}`);
-      printSystem(chalk.dim('Tip: Say "design/create/implement ..." to start a design workflow, other messages are treated as chat.\n'));
+      printSystem(`Mode: ${chalk.hex('#9944FF').bold('Project Mode')}`);
+
+      // EDA tool one-liner
+      const { available } = await checkEdaTools();
+      if (available.length > 0) {
+        const avail = available.map(t => chalk.green(t)).join(chalk.dim(', '));
+        printSystem(`EDA: ${avail}`);
+      } else {
+        printSystem(chalk.yellow('EDA: No tools detected. Install iverilog/verilator for lint & simulation.'));
+      }
+
+      printSystem(chalk.dim('Tip: Say "design/create/implement ..." to start a design workflow.\n'));
     } catch (e) {
       printSystem(`${chalk.yellow('Warning')}: ${e instanceof Error ? e.message : e}\n`);
     }
   } else {
-    printSystem(`Mode: ${chalk.dim('Claw Mode')} - use /project to enter Project Mode\n`);
+    printSystem(`Mode: ${chalk.cyan.bold('Claw Mode')} ${chalk.dim('\u2014 use /project to enter Project Mode')}\n`);
   }
 
   // Chat loop
@@ -1092,10 +1372,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
         }
       }
       // Update prompt based on mode
-      rl.setPrompt(projectMode
-        ? chalk.green.bold(`  [${currentProjectName}] > `)
-        : chalk.green.bold('  > '),
-      );
+      rl.setPrompt(buildPrompt(projectMode, currentProjectName, configManager.llm.model));
       rl.prompt();
       return;
     }
@@ -1118,7 +1395,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       targetDevice: configManager.config.project.targetDevice,
       signal: currentAbort?.signal,
       askUser,
-      executeAction: (action: Action) => executeAction(action, currentProjectPath, configManager.config.project.hdlStandard, context.logLLMTrace),
+      executeAction: (action: Action) => executeAction(action, currentProjectPath, configManager.config.project.hdlStandard, context.logLLMTrace, currentAbort?.signal),
     };
 
     // Add state management callbacks if in project mode
@@ -1162,19 +1439,18 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     } finally {
       busy = false;
       currentAbort = null;
-      if (!rlClosed) {
+      // Only restore prompt if SIGINT handler hasn't already done it
+      if (!sigintHandled && !rlClosed) {
         rl.resume();
         rl.prompt();
       }
+      sigintHandled = false;
     }
   });
 
   // Set initial prompt
   if (!rlClosed) {
-    rl.setPrompt(projectMode
-      ? chalk.green.bold(`  [${currentProjectName}] > `)
-      : chalk.green.bold('  > '),
-    );
+    rl.setPrompt(buildPrompt(projectMode, currentProjectName, configManager.llm.model));
     rl.prompt();
   }
   await new Promise<void>((resolve) => {

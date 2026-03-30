@@ -34,6 +34,19 @@ export const DEFAULT_MODELS: Record<LLMProvider, string> = {
   'openai-compatible': 'gpt-4o',
 };
 
+/** Available models per provider for selection UI. First entry is the default. */
+export const PROVIDER_MODELS: Record<LLMProvider, string[]> = {
+  openai:              ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini', 'o3', 'o4-mini'],
+  anthropic:           ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-4-5-20251001'],
+  gemini:              ['gemini-3.1-pro-preview', 'gemini-2.5-flash', 'gemini-2.5-pro'],
+  deepseek:            ['deepseek-chat', 'deepseek-reasoner'],
+  kimi:                ['moonshot-v1-128k', 'moonshot-v1-32k', 'moonshot-v1-8k'],
+  qwen:                ['qwen-max', 'qwen-plus', 'qwen-turbo'],
+  zhipu:               ['glm-4.7', 'glm-5.1', 'glm-5', 'glm-5-turbo'],
+  ollama:              ['llama3', 'qwen2.5', 'deepseek-r1', 'codellama'],
+  'openai-compatible': ['gpt-4o'],
+};
+
 // ---------------------------------------------------------------------------
 // Per-model max output tokens
 // ---------------------------------------------------------------------------

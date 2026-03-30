@@ -5,7 +5,7 @@
 import * as readline from 'node:readline';
 import type { ConfigManager } from './manager.js';
 import type { LLMConfig, LLMProvider } from './schema.js';
-import { DEFAULT_MODELS } from '../llm/factory.js';
+import { DEFAULT_MODELS, PROVIDER_MODELS } from '../llm/factory.js';
 
 async function ask(rl: readline.Interface, question: string, defaultVal?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -22,6 +22,19 @@ async function select(rl: readline.Interface, question: string, options: string[
   const answer = await ask(rl, 'Select', '1');
   const idx = parseInt(answer) - 1;
   return options[idx] ?? options[0]!;
+}
+
+async function selectModel(rl: readline.Interface, provider: LLMProvider): Promise<string> {
+  const models = PROVIDER_MODELS[provider] ?? [];
+  if (models.length === 0) {
+    return await ask(rl, 'Model name', DEFAULT_MODELS[provider]);
+  }
+  const options = [...models, '[ Custom model name ]'];
+  const choice = await select(rl, `Select model for ${provider}:`, options);
+  if (choice === '[ Custom model name ]') {
+    return await ask(rl, 'Enter model name', DEFAULT_MODELS[provider]);
+  }
+  return choice;
 }
 
 // Provider display labels → provider key
@@ -57,8 +70,7 @@ export async function runSetup(configManager: ConfigManager): Promise<void> {
   const providerKey = providerInfo.key;
 
   // Step 2: Model
-  const defaultModel = DEFAULT_MODELS[providerKey];
-  const model = await ask(rl, 'Model name', defaultModel);
+  const model = await selectModel(rl, providerKey);
 
   // Step 3: API Key
   let apiKey: string | undefined;
@@ -90,7 +102,7 @@ export async function runSetup(configManager: ConfigManager): Promise<void> {
       PROVIDER_OPTIONS.map(p => p.label),
     );
     const fbInfo = PROVIDER_OPTIONS.find(p => p.label === fbLabel) ?? PROVIDER_OPTIONS[0]!;
-    const fbModel = await ask(rl, 'Fallback model name', DEFAULT_MODELS[fbInfo.key]);
+    const fbModel = await selectModel(rl, fbInfo.key);
     let fbApiKey: string | undefined;
     if (fbInfo.needsKey) {
       fbApiKey = await ask(rl, `${fbInfo.key} API key`);

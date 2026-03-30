@@ -126,9 +126,10 @@ The JSON MUST include:
    - These define the external interface of the chip/design
    - mappedTo: (optional) maps to an internal module port
 
-7. **globalParameters**: Design-wide parameters as key-value pairs:
-   - e.g., {"DATA_WIDTH": 16, "FFT_POINTS": 1024, "PIPELINE_STAGES": 4}
+7. **globalParameters**: (optional) Design-wide parameters shared across multiple modules:
+   - Only include parameters that are truly shared (e.g., {"DATA_WIDTH": 16, "FFT_POINTS": 1024})
    - These will be auto-generated into a design_params.vh/pkg file
+   - Omit or set to {} if no shared parameters are needed
 
 8. (Optional) clockDomains, resetStrategy, pipelineStages
 
@@ -198,8 +199,9 @@ Coding rules:
 - No testbench code (VE's responsibility)
 - No speculative pipeline registers (only if Architect specified)
 - Use proper synthesizable constructs (no #delay, no initial blocks in RTL)
+- No latches: combinational blocks must assign ALL outputs in ALL branches (if/else complete, case+default)
 - No magic numbers — use parameters from design_params or module params
-- \`include "design_params.vh" at the top of each module (or import design_params_pkg::* for SV)
+- Global parameters (design_params.vh) are available via the filelist — do NOT add \`include "design_params.vh" in RTL. Just use the \`define names directly.
 - All code and comments in English
 
 Output format — fenced code block with filename:
@@ -269,7 +271,28 @@ TB and TC are SEPARATE files. Each TC is compiled and simulated independently wi
 - Each TC is a separate file with a different scenario
 - TC can directly use all signals and checker tasks declared in the TB (they share scope via include)
 
-## Checker format
+## Checker methodology
+
+**Sampling**: Always sample DUT outputs at \`@(posedge clk)\` — the output is the value that was registered on that clock edge. Never compare immediately after driving inputs on the same edge.
+
+**Latency-aware checking**: For pipeline/sequential modules, the output appears N cycles after input.
+- Use a reference queue: push expected outputs when driving inputs, pop and compare when output valid fires.
+- Example pattern for a module with 2-cycle latency:
+  \`\`\`
+  integer expected_queue[$];
+  // In stimulus: expected_queue.push_back(computed_expected);
+  // In checker: when output_valid, compare actual vs expected_queue.pop_front()
+  \`\`\`
+
+**Handshake interfaces** (valid/ready):
+- Only check data when both \`valid && ready\` are high (successful transfer).
+- Drive stimulus: assert valid with data, wait for ready, then move to next.
+
+**FIFO/memory**: Compare read data against write data in order. Use a queue to track expected read values.
+
+**Reset**: After deasserting reset, wait at least 2 clock cycles before starting any checks (allow pipeline to flush).
+
+## Checker error format
 \`$display("ERROR: signal=%s, expected=%h, got=%h, time=%0dns", signal_name, expected, actual, $time);\`
 
 ## Other rules
@@ -306,7 +329,7 @@ You will receive:
 
 Requirements:
 1. Instantiate the top-level design
-2. **Per-module checkers** at key internal signals to identify which module fails
+2. **Checkers at top-level output ports** — verify end-to-end behavior through the top module's external interface (do NOT use hierarchical references to internal signals)
 3. Checker error format: $display("ERROR: signal=%s, expected=%h, got=%h, time=%0dns", ...)
 4. Cover all specified integration test scenarios
 5. Do NOT include $dumpfile/$dumpvars

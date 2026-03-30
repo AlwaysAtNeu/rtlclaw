@@ -14,6 +14,7 @@ import {
   buildRTLLintFixMessages,
   buildRTLDebugFixMessages,
   buildRTLDebugWithVerifReqMessages,
+  buildSignalSelectMessages,
 } from '../agents/context-builder.js';
 
 /** Sum total characters in a message array (for trace logging). */
@@ -245,6 +246,57 @@ export async function fixLintErrors(
 }
 
 // ---------------------------------------------------------------------------
+// selectVCDSignals — Designer selects signals to examine from VCD waveform
+// ---------------------------------------------------------------------------
+
+export async function selectVCDSignals(
+  ctx: StageContext,
+  moduleName: string,
+  checkerOutput: string,
+  signalList: string[],
+  funcDescription: string,
+): Promise<string[]> {
+  const messages = buildSignalSelectMessages(moduleName, checkerOutput, signalList, funcDescription);
+
+  const startMs = Date.now();
+  const response = await ctx.llm.complete(messages, { temperature: 0.0 });
+  const durationMs = Date.now() - startMs;
+
+  if (ctx.logTrace) {
+    await ctx.logTrace({
+      timestamp: new Date().toISOString(),
+      role: 'RTLDesigner',
+      promptTokens: response.usage.promptTokens,
+      completionTokens: response.usage.completionTokens,
+      durationMs,
+      taskContext: `designer:signal-select:${moduleName}`,
+      promptChars: promptChars(messages),
+      responseChars: response.content.length,
+      hasCodeBlock: false,
+      retryCount: response.retryCount,
+      summary: `Signal selection for ${moduleName}`,
+      promptContent: messages,
+      responseContent: response.content,
+    });
+  }
+
+  // Parse JSON array from response
+  try {
+    const jsonMatch = response.content.match(/\[[\s\S]*?\]/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]) as unknown[];
+      return parsed.filter((s): s is string => typeof s === 'string');
+    }
+  } catch {
+    // Fall back to line-based parsing
+  }
+
+  // Fallback: extract quoted strings
+  const quoted = [...response.content.matchAll(/"([^"]+)"/g)].map(m => m[1]);
+  return quoted;
+}
+
+// ---------------------------------------------------------------------------
 // debugFix — diagnose checker failure, fix RTL or flag tb_suspect
 // ---------------------------------------------------------------------------
 
@@ -255,6 +307,7 @@ export async function debugFix(
   funcDescription: string,
   verificationReqs?: string,
   debugHistory?: string[],
+  vcdData?: string,
 ): Promise<DebugDiagnosis> {
   // Read current RTL code
   const filePath = `hw/src/hdl/${moduleName}.sv`;
@@ -281,8 +334,9 @@ export async function debugFix(
         funcDescription,
         verificationReqs,
         debugHistory,
+        vcdData,
       )
-    : buildRTLDebugFixMessages(moduleName, checkerOutput, rtlCode, funcDescription, debugHistory);
+    : buildRTLDebugFixMessages(moduleName, checkerOutput, rtlCode, funcDescription, debugHistory, vcdData);
 
   const pChars = promptChars(messages);
   const startMs = Date.now();
