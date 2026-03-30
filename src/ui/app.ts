@@ -199,9 +199,14 @@ async function executeAction(
       const lintStartMs = Date.now();
       let lintCmd = '';
       let lintResult = '';
+
+      // Use filelist for dependencies and include paths if available
+      const filelistPath = path.join(baseDir, 'hw/src/filelist/design.f');
+      const filelistArg = existsSync(filelistPath) ? ` -f ${filelistPath}` : '';
+
       try {
         execSync(`which verilator`, { encoding: 'utf-8' });
-        lintCmd = `${envPrefix}verilator --lint-only -Wall ${filePath} 2>&1 || true`;
+        lintCmd = `${envPrefix}verilator --lint-only -Wall${filelistArg} ${filePath} 2>&1 || true`;
         lintResult = execSync(lintCmd, {
           cwd: baseDir, encoding: 'utf-8', timeout: 30_000, shell: '/bin/bash',
         });
@@ -209,7 +214,7 @@ async function executeAction(
       } catch {
         try {
           execSync(`which iverilog`, { encoding: 'utf-8' });
-          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull ${filePath} 2>&1 || true`;
+          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull${filelistArg} ${filePath} 2>&1 || true`;
           lintResult = execSync(lintCmd, {
             cwd: baseDir, encoding: 'utf-8', timeout: 30_000, shell: '/bin/bash',
           });
@@ -234,7 +239,7 @@ async function executeAction(
     }
 
     case 'runSimulation': {
-      const payload = action.payload as { module?: string; testType: 'ut' | 'st' };
+      const payload = action.payload as { module?: string; testType: 'ut' | 'st'; tc?: string };
       const { execSync } = await import('node:child_process');
       const iverilogGen = hdlStandardToIverilogGen(hdlStandard);
 
@@ -295,14 +300,20 @@ async function executeAction(
 
       if (usesTcInclude && tcFiles.length > 0) {
         // ── TB/TC separated via `include ──
+        // If a specific TC is requested, only run that one
+        const tcsToRun = payload.tc
+          ? tcFiles.filter(f => f === payload.tc || f.includes(payload.tc!))
+          : tcFiles;
+
         const allResults: string[] = [];
         let allPassed = true;
 
-        for (const tcFile of tcFiles) {
+        for (const tcFile of tcsToRun) {
           const tcFilePath = path.join(tcPath, tcFile);
-          const tcRelPath = path.relative(tbPath, tcFilePath);
-          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcRelPath}"`);
           const tempTBPath = path.join(simDir, `tb_temp_${tcFile}`);
+          // Calculate TC path relative to where the temp TB file will be (simDir)
+          const tcRelPath = path.relative(simDir, tcFilePath);
+          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcRelPath}"`);
           await fs.writeFile(tempTBPath, tempTBContent, 'utf-8');
 
           const vvpPath = path.join(simDir, `sim_${tcFile.replace(/\.\w+$/, '')}.vvp`);
@@ -341,6 +352,12 @@ async function executeAction(
               summary: tcPassed ? 'PASSED' : `FAILED`,
               responseContent: `$ ${compileCmd}\n$ ${runCmd}\n\n${tcOutput}`,
             });
+          }
+
+          // Stop at first failure — report which TC failed so debug loop can target it
+          if (!tcPassed) {
+            allResults.push(`FAILING_TC: ${tcFile}`);
+            break;
           }
         }
 

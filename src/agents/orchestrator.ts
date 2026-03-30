@@ -39,7 +39,7 @@ import {
   parsePhase1Response,
 } from '../stages/architect-p1.js';
 import { runArchitectPhase2 } from '../stages/architect-p2.js';
-import { writeModule, fixLintErrors, debugFix } from '../stages/rtl-writer.js';
+import { writeModule, fixLintErrors, debugFix, selectVCDSignals } from '../stages/rtl-writer.js';
 import { generateUTTestbench, reviewTB, addVCDToTB, fixCompileErrors, auditSpecVsChecker } from '../stages/ve-ut.js';
 import type { SpecCheckerAuditResult } from '../stages/ve-ut.js';
 import { generateSTTestbench } from '../stages/ve-st.js';
@@ -48,6 +48,8 @@ import { generateSummary } from '../stages/summary.js';
 import { validatePhase1Structure } from '../stages/structural-validation.js';
 import { generateDesignParams } from '../stages/design-params-gen.js';
 import { generateTopModule } from '../stages/top-gen.js';
+import { VCDParser } from '../parser/vcd-parser.js';
+import { parseCheckerOutput } from '../parser/checker-parser.js';
 import {
   buildSTTriageMessages,
   buildArchitectP1RevisionMessages,
@@ -1112,6 +1114,8 @@ export class Orchestrator {
     const errorCounts = new Map<string, number>();
     errorCounts.set(lastNormalizedError, 1);
     let consecutiveSimilarCheckerRounds = 0;
+    let vcdEnabled = false;
+    let vcdData: string | undefined;
 
     // ── Spec-Checker Audit: conclusive diagnosis before guessing ──
     // Run once at the start of debug loop if we have P2 spec and TB code
@@ -1241,6 +1245,7 @@ export class Orchestrator {
           funcDesc,
           verifReqs,
           mod.debugHistory.length > 0 ? mod.debugHistory : undefined,
+          vcdData,
         );
 
         // v3: Collect fix_summary into debug history
@@ -1289,18 +1294,34 @@ export class Orchestrator {
         }
       }
 
-      // v3: Re-run ALL TCs for the module (regression), not just the failing one
+      // Re-sim: run failing TC, then regression if it passes
       if (!context.executeAction) break;
 
       try {
+        const failingTC = this.extractFailingTC(currentError);
         const simStartMs = Date.now();
-        const result = await context.executeAction({
+        let result = await context.executeAction({
           type: 'runSimulation',
-          payload: { module: mod.name, testType: 'ut', regression: true },
+          payload: { module: mod.name, testType: 'ut', ...(failingTC ? { tc: failingTC } : {}) },
         });
         const simDurationMs = Date.now() - simStartMs;
 
-        const passed = result.includes('TEST PASSED') || result.includes('PASSED');
+        let passed = result.includes('TEST PASSED') || result.includes('PASSED');
+
+        // If failing TC now passes, run full regression to catch regressions in other TCs
+        if (passed && failingTC) {
+          yield { type: 'progress', content: `${failingTC} now passes, running full regression...` };
+          const regResult = await context.executeAction({
+            type: 'runSimulation',
+            payload: { module: mod.name, testType: 'ut' },
+          });
+          passed = regResult.includes('TEST PASSED') || regResult.includes('PASSED');
+          if (!passed) {
+            // A different TC failed — switch to debugging that one
+            result = regResult;
+            yield { type: 'status', content: `Regression found new failure: ${this.extractFailingTC(regResult) ?? 'unknown TC'}` };
+          }
+        }
 
         // Log simulation result
         if (ctx.logTrace) {
@@ -1341,15 +1362,72 @@ export class Orchestrator {
         errorCounts.set(lastNormalizedError, (errorCounts.get(lastNormalizedError) ?? 0) + 1);
         currentError = result;
 
-        // v3: VCD fallback after 4 consecutive similar checker output rounds
-        if (consecutiveSimilarCheckerRounds >= VCD_FALLBACK_THRESHOLD) {
+        // v3: VCD fallback — trigger, re-sim, and parse in one step
+        if (!vcdEnabled && consecutiveSimilarCheckerRounds >= VCD_FALLBACK_THRESHOLD) {
           await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=VCD_fallback similar=${consecutiveSimilarCheckerRounds}`);
           yield { type: 'status', content: `${VCD_FALLBACK_THRESHOLD} consecutive similar errors — enabling VCD for debug...` };
           const vcdAdded = await addVCDToTB(ctx, mod.name, []);
           if (vcdAdded) {
-            yield { type: 'progress', content: 'VCD dump added to testbench. Re-simulating...' };
+            vcdEnabled = true;
+            yield { type: 'progress', content: 'VCD dump added to testbench. Re-simulating to capture waveform...' };
+            // Immediate re-sim (failing TC only) to generate VCD file
+            if (context.executeAction) {
+              try {
+                const vcdFailingTC = this.extractFailingTC(currentError);
+                const vcdSimResult = await context.executeAction({
+                  type: 'runSimulation',
+                  payload: { module: mod.name, testType: 'ut', ...(vcdFailingTC ? { tc: vcdFailingTC } : {}) },
+                });
+                // Update currentError with VCD-enabled sim result
+                currentError = vcdSimResult;
+              } catch {
+                // Re-sim failed — continue with old error
+              }
+            }
           }
-          consecutiveSimilarCheckerRounds = 0; // Reset after VCD fallback
+          consecutiveSimilarCheckerRounds = 0;
+        }
+
+        // v3: Parse VCD waveform when available
+        vcdData = undefined;
+        if (vcdEnabled && context.projectPath) {
+          try {
+            const vcdPath = `${context.projectPath}/hw/dv/ut/sim/wave.vcd`;
+            const parser = new VCDParser();
+            const vcd = await parser.parse(vcdPath);
+
+            // Convert checker error time (ns) to VCD time units
+            const checkerErrors = parseCheckerOutput(currentError);
+            const firstErrorTimeNs = checkerErrors.find(e => e.timeNs > 0)?.timeNs ?? 0;
+            const vcdTimePerNs = this.parseTimescaleToNs(vcd.timescale);
+            const errorTimeVCD = vcdTimePerNs > 0 ? firstErrorTimeNs / vcdTimePerNs : firstErrorTimeNs;
+
+            // Window: 20 clock-ish units before error to 10 after
+            const windowStart = errorTimeVCD > 0 ? Math.max(0, errorTimeVCD - 20) : 0;
+            const windowEnd = errorTimeVCD > 0 ? errorTimeVCD + 10 : Math.min(vcd.endTime, 200);
+
+            // Let Designer select which signals to examine
+            const allSignalNames = vcd.signals.map(s => s.name);
+            const funcDesc = phase2?.functionalSpec ?? '';
+            let selectedSignals: string[] = [];
+            if (allSignalNames.length > 25) {
+              selectedSignals = await selectVCDSignals(ctx, mod.name, currentError, allSignalNames, funcDesc);
+              yield { type: 'progress', content: `Designer selected ${selectedSignals.length} signals for waveform analysis` };
+            }
+            // If <=25 signals or selection returned nothing, use all
+            if (selectedSignals.length === 0) {
+              selectedSignals = allSignalNames;
+            }
+
+            const extracted = parser.extractWindow(vcd, selectedSignals, windowStart, windowEnd);
+            const formatted = parser.formatAsTable(extracted, checkerErrors.map(e => e.raw));
+            if (formatted && !formatted.startsWith('No ')) {
+              vcdData = formatted;
+              yield { type: 'progress', content: `VCD waveform: ${extracted.signals.length} signals, time ${windowStart}-${windowEnd} (${vcd.timescale})` };
+            }
+          } catch {
+            // VCD parse failure is non-fatal — continue without waveform data
+          }
         }
       } catch {
         break;
@@ -1889,6 +1967,27 @@ export class Orchestrator {
       lower.includes('$finish') ||
       lower.includes('vcd info');           // VCD dump started = sim ran
     return hasCompileIndicators && !hasRuntimeOutput;
+  }
+
+  /**
+   * Convert VCD timescale string (e.g. "1ns", "10ps", "100us") to nanoseconds per unit.
+   * Returns how many ns one VCD time unit represents.
+   */
+  private parseTimescaleToNs(timescale: string): number {
+    const match = timescale.match(/(\d+)\s*(s|ms|us|ns|ps|fs)/i);
+    if (!match) return 1; // default: assume 1ns
+    const value = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+    const unitToNs: Record<string, number> = {
+      's': 1e9, 'ms': 1e6, 'us': 1e3, 'ns': 1, 'ps': 1e-3, 'fs': 1e-6,
+    };
+    return value * (unitToNs[unit] ?? 1);
+  }
+
+  /** Extract failing TC filename from simulation output (e.g. "FAILING_TC: tc_counter_basic.sv") */
+  private extractFailingTC(simOutput: string): string | undefined {
+    const match = simOutput.match(/FAILING_TC:\s*(\S+)/);
+    return match ? match[1] : undefined;
   }
 
   private normalizeError(error: string): string {

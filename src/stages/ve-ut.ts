@@ -15,7 +15,6 @@ import type { StageContext, OutputChunk } from './types.js';
 import {
   buildVEUnitTBMessages,
   buildVETBReviewMessages,
-  buildVEAddVCDMessages,
   buildVECompileFixMessages,
   buildSpecCheckerAuditMessages,
 } from '../agents/context-builder.js';
@@ -326,7 +325,7 @@ export async function reviewTB(
 export async function addVCDToTB(
   ctx: StageContext,
   moduleName: string,
-  failingSignals: string[],
+  _failingSignals: string[],
 ): Promise<boolean> {
   // Read current TB
   const tbPathSV = `hw/dv/ut/sim/tb/tb_${moduleName}.sv`;
@@ -346,32 +345,24 @@ export async function addVCDToTB(
     }
   }
 
-  const messages = buildVEAddVCDMessages(tbCode, failingSignals);
-
-  const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.0 });
-  const durationMs = Date.now() - startMs;
-
-  const blocks = parseLLMCodeBlocks(response.content);
-  const updatedCode = blocks.length > 0 ? blocks[0].content : response.content;
-
-  if (ctx.logTrace) {
-    await ctx.logTrace({
-      timestamp: new Date().toISOString(),
-      role: 'VerificationEngineer',
-      promptTokens: response.usage.promptTokens,
-      completionTokens: response.usage.completionTokens,
-      durationMs,
-      taskContext: `ve-ut:add-vcd:${moduleName}`,
-      promptChars: promptChars(messages),
-      responseChars: response.content.length,
-      hasCodeBlock: blocks.length > 0,
-      retryCount: response.retryCount,
-      summary: `VCD add for ${moduleName}`,
-      promptContent: messages,
-      responseContent: response.content,
-    });
+  // Already has VCD dump — skip
+  if (tbCode.includes('$dumpfile') || tbCode.includes('$dumpvars')) {
+    return true;
   }
+
+  // Deterministic insertion: find the TB module name and insert after `initial begin`
+  const tbModMatch = tbCode.match(/module\s+(\w+)/);
+  const tbModName = tbModMatch ? tbModMatch[1] : `tb_${moduleName}`;
+
+  // Insert $dumpfile/$dumpvars after the first `initial begin`
+  const initialIdx = tbCode.indexOf('initial begin');
+  if (initialIdx < 0) return false;
+
+  const insertPos = tbCode.indexOf('\n', initialIdx);
+  if (insertPos < 0) return false;
+
+  const vcdSnippet = `\n    $dumpfile("wave.vcd");\n    $dumpvars(0, ${tbModName});`;
+  const updatedCode = tbCode.slice(0, insertPos) + vcdSnippet + tbCode.slice(insertPos);
 
   await ctx.executeAction({
     type: 'writeFile',

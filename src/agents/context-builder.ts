@@ -269,14 +269,19 @@ export function buildRTLDebugFixMessages(
   rtlCode: string,
   funcDescription: string,
   debugHistory?: string[],
+  vcdData?: string,
 ): Message[] {
   let userContent = `Module "${moduleName}" failed unit test.
 
 Checker errors:
-${checkerOutput}
+${checkerOutput}`;
 
-Module functional description:
-${funcDescription}`;
+  // v3: Include VCD waveform data when available (fallback debug)
+  if (vcdData) {
+    userContent += `\n\nVCD waveform data around error time:\n\`\`\`\n${vcdData}\n\`\`\`\nUse the waveform to trace signal transitions and identify the root cause.`;
+  }
+
+  userContent += `\n\nModule functional description:\n${funcDescription}`;
 
   // v3: Include debug history so Designer doesn't repeat fixes
   if (debugHistory?.length) {
@@ -302,14 +307,19 @@ export function buildRTLDebugWithVerifReqMessages(
   funcDescription: string,
   verificationReqs: string,
   debugHistory?: string[],
+  vcdData?: string,
 ): Message[] {
   let userContent = `Module "${moduleName}" failed unit test.
 
 Checker errors:
-${checkerOutput}
+${checkerOutput}`;
 
-Module functional description:
-${funcDescription}
+  // v3: Include VCD waveform data when available (fallback debug)
+  if (vcdData) {
+    userContent += `\n\nVCD waveform data around error time:\n\`\`\`\n${vcdData}\n\`\`\`\nUse the waveform to trace signal transitions and identify the root cause.`;
+  }
+
+  userContent += `\n\nModule functional description:\n${funcDescription}
 
 Verification requirements (from Architect):
 ${verificationReqs}`;
@@ -440,28 +450,38 @@ ${moduleInfo}`;
 }
 
 // ---------------------------------------------------------------------------
-// VE: add VCD dump to existing TB (fallback for debug)
+// Designer: select VCD signals to examine for waveform debug
 // ---------------------------------------------------------------------------
 
-export function buildVEAddVCDMessages(
-  tbCode: string,
-  failingSignals: string[],
+export function buildSignalSelectMessages(
+  moduleName: string,
+  checkerOutput: string,
+  signalList: string[],
+  funcDescription: string,
 ): Message[] {
   return [
     {
       role: 'system',
-      content: `You are a Verification Engineer. Add VCD waveform dumping to an existing testbench.
-Add $dumpfile("wave.vcd") and $dumpvars(0, <tb_module>) to the initial block.
-Output the complete modified testbench file. Keep everything else unchanged.`,
+      content: `You are the RTL Designer debugging a simulation failure using VCD waveforms.
+Given the checker errors and the full list of available signals, select the signals most relevant to diagnosing the root cause.
+
+Reply with ONLY a JSON array of signal names (hierarchical, as shown in the list). Select 10-25 signals.
+Include: failing signals, their direct drivers/consumers, clock, reset, and any FSM state or control signals that could explain the error.
+
+Example: ["tb.dut.clk", "tb.dut.rst_n", "tb.dut.data_out", "tb.dut.state"]`,
     },
     {
       role: 'user',
-      content: `Add VCD dump to this testbench. Failing signals for reference: ${failingSignals.join(', ')}
+      content: `Module: ${moduleName}
 
-Testbench:
-\`\`\`
-${tbCode}
-\`\`\``,
+Checker errors:
+${checkerOutput}
+
+Module functional description:
+${funcDescription}
+
+Available signals (${signalList.length} total):
+${signalList.join('\n')}`,
     },
   ];
 }
