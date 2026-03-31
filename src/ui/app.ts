@@ -163,19 +163,27 @@ function printSystem(text: string): void {
   console.log(chalk.dim('  ' + text));
 }
 
-function printUser(text: string): void {
+function printUser(_text?: string): void {
   console.log(DIVIDER());
-  console.log(chalk.green.bold('  \u276F You: ') + text);
   console.log();
 }
 
-function buildPrompt(projectMode: boolean, projectName?: string, modelName?: string): string {
-  const modelTag = modelName ? chalk.dim(`[${modelName}]`) + ' ' : '';
-  if (projectMode && projectName) {
-    return `  ${modelTag}${chalk.hex('#9944FF').bold(projectName)} ${chalk.hex('#9944FF').bold('\u276F')} `;
-  }
-  return `  ${modelTag}${chalk.cyan.bold('\u276F')} `;
+function buildPrompt(): string {
+  return `  ${chalk.cyan.bold('\u276F')} `;
 }
+
+/** Print a context bar above the prompt showing model and project info */
+function printContextBar(modelName?: string, projectName?: string): void {
+  const tags: string[] = [];
+  if (modelName) tags.push(chalk.hex('#00BBFF')(modelName));
+  if (projectName) tags.push(chalk.hex('#9944FF')(projectName));
+  if (tags.length > 0) {
+    console.log(chalk.dim('  \u2500\u2500 ') + tags.join(chalk.dim(' \u2502 ')) + chalk.dim(' ' + '\u2500'.repeat(Math.max(0, COLS() - 10 - (modelName?.length ?? 0) - (projectName?.length ?? 0)))));
+  } else {
+    console.log(DIVIDER());
+  }
+}
+
 
 function printError(text: string): void {
   console.log(chalk.red('  \u2718 Error: ') + text);
@@ -829,23 +837,165 @@ const COMMANDS: CommandDef[] = [
   { name: '/quit', description: 'Exit' },
 ];
 
-function getCompletions(line: string): [string[], string] {
-  const trimmed = line.trimStart();
-  if (!trimmed.startsWith('/')) return [[], trimmed];
+interface FlatCommand {
+  name: string;
+  args?: string;
+  description: string;
+}
 
-  // Collect all completable command strings (including subcommands)
-  const allCmds: string[] = [];
+/** Flatten COMMANDS into a single list including subcommands. */
+function getAllCommands(): FlatCommand[] {
+  const result: FlatCommand[] = [];
   for (const cmd of COMMANDS) {
-    allCmds.push(cmd.name);
     if (cmd.subcommands) {
       for (const sub of cmd.subcommands) {
-        allCmds.push(sub.name);
+        result.push(sub);
       }
+    } else {
+      result.push(cmd);
     }
   }
+  return result;
+}
 
-  const matches = allCmds.filter(c => c.startsWith(trimmed));
-  return [matches, trimmed];
+/** Strip ANSI escape codes to get visible character count. */
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+/**
+ * Dropdown command suggestions rendered below the prompt line.
+ *
+ * NEVER uses \x1b[s / \x1b[u (save/restore cursor) — readline's internal
+ * rendering overwrites the single save-slot and corrupts our restore position.
+ *
+ * Instead we use only:
+ *   \x1b[<n>B  — cursor down n lines (to reach suggestion lines)
+ *   \x1b[<n>A  — cursor up n lines (back to prompt)
+ *   \x1b[2K    — erase entire line
+ *   \r         — carriage return (col 0)
+ *   readline.cursorTo — explicit column positioning after returning to prompt
+ */
+class CommandSuggestions {
+  private renderedCount = 0;
+  private selectedIdx = 0;
+  private matches: FlatCommand[] = [];
+  private active = process.stdout.isTTY === true;
+  private rl: readline.Interface;
+
+  constructor(rl: readline.Interface) {
+    this.rl = rl;
+  }
+
+  refresh(line: string): void {
+    if (!this.active) return;
+    const trimmed = line.trimStart();
+
+    if (!trimmed.startsWith('/') || trimmed.length < 1) {
+      this.hide();
+      return;
+    }
+
+    const all = getAllCommands();
+    const newMatches = all.filter(c => c.name.startsWith(trimmed));
+
+    if (newMatches.length === 0 || (newMatches.length === 1 && newMatches[0]!.name === trimmed)) {
+      this.hide();
+      return;
+    }
+
+    this.matches = newMatches;
+    if (this.selectedIdx >= this.matches.length) this.selectedIdx = 0;
+    this.render();
+  }
+
+  moveUp(): void {
+    if (this.matches.length === 0) return;
+    this.selectedIdx = this.selectedIdx <= 0 ? this.matches.length - 1 : this.selectedIdx - 1;
+    this.render();
+  }
+
+  moveDown(): void {
+    if (this.matches.length === 0) return;
+    this.selectedIdx = this.selectedIdx >= this.matches.length - 1 ? 0 : this.selectedIdx + 1;
+    this.render();
+  }
+
+  accept(): string | null {
+    if (this.matches.length === 0) return null;
+    const cmd = this.matches[this.selectedIdx]!.name + ' ';
+    this.hide();
+    return cmd;
+  }
+
+  isVisible(): boolean { return this.renderedCount > 0; }
+
+  hide(): void {
+    this.clearLines();
+    this.matches = [];
+    this.selectedIdx = 0;
+  }
+
+  pause(): void { this.active = false; this.hide(); }
+  resume(): void { this.active = true; }
+
+  // -- internal --------------------------------------------------------
+
+  private render(): void {
+    this.clearLines();
+
+    const items = this.matches.slice(0, 8);
+    const out = process.stdout;
+    const n = items.length;
+
+    // Pre-scroll: write N newlines to ensure terminal has room below.
+    // Then move back up. This handles the case where the prompt is near
+    // the bottom of the screen — the terminal scrolls to make space.
+    for (let i = 0; i < n; i++) out.write('\n');
+    out.write(`\x1b[${n}A`);
+
+    // Render each suggestion line below the prompt
+    for (let i = 0; i < items.length; i++) {
+      const m = items[i]!;
+      const sel = i === this.selectedIdx;
+      const prefix = sel ? chalk.cyan(' \u25B8 ') : '   ';
+      const name = sel ? chalk.cyan.bold(m.name) : chalk.cyan(m.name);
+      const args = m.args ? chalk.dim(` ${m.args}`) : '';
+      const desc = chalk.dim(` \u2014 ${m.description}`);
+      out.write('\x1b[1B');                 // cursor down 1
+      out.write('\r\x1b[2K');               // col 0 + clear entire line
+      out.write(`${prefix}${name}${args}${desc}`);
+    }
+
+    this.renderedCount = items.length;
+
+    // Return to prompt line and position cursor correctly
+    out.write(`\x1b[${n}A`);               // move up N lines
+    this.positionCursor();
+  }
+
+  private clearLines(): void {
+    if (this.renderedCount === 0) return;
+    const out = process.stdout;
+    // Move down to each suggestion line and clear it
+    for (let i = 0; i < this.renderedCount; i++) {
+      out.write('\x1b[1B');                 // cursor down 1
+      out.write('\r\x1b[2K');               // col 0 + clear line
+    }
+    // Return to prompt line
+    out.write(`\x1b[${this.renderedCount}A`);
+    this.positionCursor();
+    this.renderedCount = 0;
+  }
+
+  /** Put cursor at the correct column on the prompt line. */
+  private positionCursor(): void {
+    const prompt = (this.rl as any)._prompt ?? '';
+    const promptWidth = stripAnsi(prompt).length;
+    const cursor: number = (this.rl as any).cursor ?? 0;
+    readline.cursorTo(process.stdout, promptWidth + cursor);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -863,6 +1013,7 @@ async function handleCommand(
   input: string,
   config: ConfigManager,
   currentProjectPath: string | undefined,
+  askUser?: (question: string) => Promise<string>,
 ): Promise<CommandResult> {
   const parts = input.trim().split(/\s+/);
   const cmd = parts[0]!.toLowerCase();
@@ -890,19 +1041,46 @@ async function handleCommand(
         printSystem(`Model switched to: ${chalk.cyan(parts[1])}`);
         return { recreateBackend: true };
       }
-      // Show available models for current provider
+      // Interactive model selection for current provider
       const { PROVIDER_MODELS } = await import('../llm/factory.js');
       const models = PROVIDER_MODELS[config.llm.provider] ?? [];
       const current = config.llm.model;
-      printSystem(`Provider: ${chalk.cyan(config.llm.provider)}  Model: ${chalk.cyan.bold(current)}`);
-      if (models.length > 0) {
-        console.log(chalk.dim('  Available models:'));
-        for (const m of models) {
-          const marker = m === current ? chalk.green(' \u25CF') : chalk.dim(' \u25CB');
-          console.log(`  ${marker} ${m === current ? chalk.bold(m) : m}`);
-        }
-        console.log(chalk.dim('  Use: /model <name> to switch\n'));
+      if (models.length === 0 || !askUser) {
+        printSystem(`Provider: ${chalk.cyan(config.llm.provider)}  Model: ${chalk.cyan.bold(current)}`);
+        return {};
       }
+      console.log(chalk.bold(`\n  ${config.llm.provider} models:`));
+      models.forEach((m, i) => {
+        const marker = m === current ? chalk.green(' \u25CF') : chalk.dim(' \u25CB');
+        console.log(`  ${chalk.cyan(`${i + 1})`)}${marker} ${m === current ? chalk.bold(m) : m}`);
+      });
+      console.log(`  ${chalk.cyan(`${models.length + 1})`)} ${chalk.dim('Custom model name')}`);
+      console.log(`  ${chalk.cyan(`0)`)} ${chalk.dim('Cancel')}`);
+      console.log();
+      const answer = await askUser('Select model:');
+      const idx = parseInt(answer.trim());
+      if (idx === 0 || isNaN(idx)) {
+        printSystem('Cancelled.');
+        return {};
+      }
+      if (idx >= 1 && idx <= models.length) {
+        const selected = models[idx - 1]!;
+        if (selected === current) {
+          printSystem(`Already using ${chalk.cyan(selected)}.`);
+          return {};
+        }
+        config.setLLM({ model: selected });
+        printSystem(`Model switched to: ${chalk.cyan.bold(selected)}`);
+        return { recreateBackend: true };
+      }
+      if (idx === models.length + 1) {
+        const customName = await askUser('Enter model name:');
+        if (!customName.trim()) { printSystem('Cancelled.'); return {}; }
+        config.setLLM({ model: customName.trim() });
+        printSystem(`Model switched to: ${chalk.cyan.bold(customName.trim())}`);
+        return { recreateBackend: true };
+      }
+      printSystem('Invalid selection.');
       return {};
     }
     case '/provider':
@@ -1173,52 +1351,18 @@ async function processOrchestratorOutput(
 }
 
 // --------------------------------------------------------------------------
-// Startup project prompt
-// --------------------------------------------------------------------------
-
-async function startupProjectPrompt(rl: readline.Interface): Promise<{ path: string; name: string } | null> {
-  const { ProjectManager } = await import('../project/manager.js');
-  const pm = new ProjectManager();
-  const projects = await pm.listProjects();
-
-  if (projects.length === 0) return null;
-
-  console.log(chalk.bold('\n  Recent projects:'));
-  projects.forEach((p, i) => {
-    console.log(`  ${chalk.cyan(`${i + 1})`)} ${p.name.padEnd(20)} ${chalk.dim(p.rootPath)}`);
-  });
-  console.log(`  ${chalk.cyan(`${projects.length + 1})`)} ${chalk.dim('Start in Claw Mode (no project)')}`);
-  console.log();
-
-  return new Promise((resolve) => {
-    try {
-      rl.question(chalk.green.bold('  Select: '), (answer) => {
-        const idx = parseInt(answer.trim()) - 1;
-        if (idx >= 0 && idx < projects.length) {
-          resolve({ path: projects[idx]!.rootPath, name: projects[idx]!.name });
-        } else {
-          resolve(null);
-        }
-      });
-    } catch {
-      resolve(null);
-    }
-    rl.once('close', () => resolve(null));
-  });
-}
-
-// --------------------------------------------------------------------------
 // Main loop
 // --------------------------------------------------------------------------
 
 export async function startApp(configManager: ConfigManager, projectPath?: string): Promise<void> {
   printHeader();
 
-  const providerInfo = `${configManager.llm.provider}/${configManager.llm.model}`;
   const fallbackInfo = configManager.config.fallbackLlm
-    ? ` (fallback: ${configManager.config.fallbackLlm.provider}/${configManager.config.fallbackLlm.model})`
+    ? chalk.dim(`  fallback: ${configManager.config.fallbackLlm.provider}/${configManager.config.fallbackLlm.model}`)
     : '';
-  printSystem(`Using ${chalk.cyan(providerInfo)}${fallbackInfo}. Type ${chalk.cyan('/help')} for commands.\n`);
+  printContextBar(configManager.llm.model);
+  if (fallbackInfo) printSystem(fallbackInfo);
+  printSystem(`Type ${chalk.cyan('/help')} for commands.\n`);
 
   // Create backend (with optional fallback)
   const { createBackendWithFallback } = await import('../llm/factory.js');
@@ -1242,10 +1386,77 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: buildPrompt(false, undefined, configManager.llm.model),
+    prompt: buildPrompt(),
     terminal: true,
-    completer: (line: string) => getCompletions(line),
   });
+
+  // Dropdown command suggestions
+  const suggestions = new CommandSuggestions(rl);
+
+  // Monkey-patch _ttyWrite to intercept keys BEFORE readline processes them.
+  // This lets us swallow Tab/Up/Down when the dropdown is open, avoiding
+  // conflicts with readline's built-in completer and history navigation.
+  const origTtyWrite = (rl as any)._ttyWrite;
+  (rl as any)._ttyWrite = function (s: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean; sequence?: string }) {
+    if (busy || rlClosed) {
+      return origTtyWrite.call(this, s, key);
+    }
+
+    const dropdownOpen = suggestions.isVisible();
+
+    // Tab → accept dropdown selection (swallow key entirely)
+    if (key?.name === 'tab') {
+      const accepted = suggestions.accept();
+      if (accepted) {
+        // Replace readline's internal line buffer
+        (rl as any).line = accepted;
+        (rl as any).cursor = accepted.length;
+        // Redraw prompt + accepted text
+        readline.clearLine(process.stdout, 0);
+        readline.cursorTo(process.stdout, 0);
+        process.stdout.write((rl as any)._prompt + accepted);
+        // Refresh dropdown for the new input
+        suggestions.refresh(accepted);
+        return; // swallow Tab
+      }
+      // No dropdown → just swallow Tab (don't trigger readline completer)
+      return;
+    }
+
+    // Up/Down → navigate dropdown if open (swallow key)
+    if (key?.name === 'up' && dropdownOpen) {
+      suggestions.moveUp();
+      return;
+    }
+    if (key?.name === 'down' && dropdownOpen) {
+      suggestions.moveDown();
+      return;
+    }
+
+    // Enter → hide dropdown, let readline process the line
+    if (key?.name === 'return') {
+      suggestions.hide();
+      return origTtyWrite.call(this, s, key);
+    }
+
+    // Escape → hide dropdown, keep input as-is
+    if (key?.name === 'escape') {
+      suggestions.hide();
+      return;
+    }
+
+    // Ctrl+C → hide dropdown, let readline handle SIGINT
+    if (key?.ctrl && key?.name === 'c') {
+      suggestions.hide();
+      return origTtyWrite.call(this, s, key);
+    }
+
+    // All other keys: hide dropdown → let readline process → refresh dropdown
+    suggestions.hide();
+    origTtyWrite.call(this, s, key);
+    const newLine = (rl as any).line as string ?? '';
+    suggestions.refresh(newLine);
+  };
 
   let rlClosed = false;
   // AbortController for cancelling in-flight LLM requests on Ctrl+C
@@ -1268,7 +1479,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       sigintHandled = true;
       if (!rlClosed) {
         rl.resume();
-        rl.prompt();
+        showPrompt();
       }
     } else {
       // Idle — exit
@@ -1299,53 +1510,27 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     });
   };
 
-  // Startup: project selection
-  if (!currentProjectPath) {
-    const selected = await startupProjectPrompt(rl);
-    if (selected) {
-      currentProjectPath = selected.path;
-      currentProjectName = selected.name;
-    }
-  }
+  /** Show context bar + prompt */
+  const showPrompt = () => {
+    printContextBar(configManager.llm.model, projectMode ? currentProjectName : undefined);
+    rl.prompt();
+  };
 
-  if (currentProjectPath) {
-    try {
-      const { ProjectManager } = await import('../project/manager.js');
-      const pm = new ProjectManager();
-      const info = await pm.openProject(currentProjectPath);
-      currentProjectName = info.name;
-      projectMode = true;
-      printSystem(`Project: ${chalk.bold(info.name)} (${info.rootPath})`);
-      printSystem(`Mode: ${chalk.hex('#9944FF').bold('Project Mode')}`);
-
-      // EDA tool one-liner
-      const { available } = await checkEdaTools();
-      if (available.length > 0) {
-        const avail = available.map(t => chalk.green(t)).join(chalk.dim(', '));
-        printSystem(`EDA: ${avail}`);
-      } else {
-        printSystem(chalk.yellow('EDA: No tools detected. Install iverilog/verilator for lint & simulation.'));
-      }
-
-      printSystem(chalk.dim('Tip: Say "design/create/implement ..." to start a design workflow.\n'));
-    } catch (e) {
-      printSystem(`${chalk.yellow('Warning')}: ${e instanceof Error ? e.message : e}\n`);
-    }
-  } else {
-    printSystem(`Mode: ${chalk.cyan.bold('Claw Mode')} ${chalk.dim('\u2014 use /project to enter Project Mode')}\n`);
-  }
+  // Always start in Claw Mode — user uses /project to open or create a project
+  printSystem(`Mode: ${chalk.cyan.bold('Claw Mode')} ${chalk.dim('\u2014 use /project to enter Project Mode')}\n`);
 
   // Chat loop
   let busy = false;
 
   rl.on('line', async (line: string) => {
     const input = line.trim();
-    if (!input) { rl.prompt(); return; }
+    if (!input) { showPrompt(); return; }
     if (busy) return;
 
     // Commands
     if (input.startsWith('/')) {
-      const result = await handleCommand(input, configManager, currentProjectPath);
+      suggestions.hide();
+      const result = await handleCommand(input, configManager, currentProjectPath, askUser);
       if (result.clearHistory) history.length = 0;
       if (result.recreateBackend) {
         try {
@@ -1372,16 +1557,17 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
         }
       }
       // Update prompt based on mode
-      rl.setPrompt(buildPrompt(projectMode, currentProjectName, configManager.llm.model));
-      rl.prompt();
+      rl.setPrompt(buildPrompt());
+      showPrompt();
       return;
     }
 
     // Chat message
     busy = true;
+    suggestions.pause();
     currentAbort = new AbortController();
     rl.pause();
-    printUser(input);
+    printUser();
     spinner.start('Thinking...');
 
     // Build context
@@ -1439,10 +1625,11 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     } finally {
       busy = false;
       currentAbort = null;
+      suggestions.resume();
       // Only restore prompt if SIGINT handler hasn't already done it
       if (!sigintHandled && !rlClosed) {
         rl.resume();
-        rl.prompt();
+        showPrompt();
       }
       sigintHandled = false;
     }
@@ -1450,8 +1637,8 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
 
   // Set initial prompt
   if (!rlClosed) {
-    rl.setPrompt(buildPrompt(projectMode, currentProjectName, configManager.llm.model));
-    rl.prompt();
+    rl.setPrompt(buildPrompt());
+    showPrompt();
   }
   await new Promise<void>((resolve) => {
     if (rlClosed) { resolve(); return; }
