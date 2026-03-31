@@ -48,6 +48,7 @@ import { generateSummary } from '../stages/summary.js';
 import { validatePhase1Structure } from '../stages/structural-validation.js';
 import { generateDesignParams } from '../stages/design-params-gen.js';
 import { generateTopModule } from '../stages/top-gen.js';
+import { runInfraDebug } from '../stages/infra-debug.js';
 import { VCDParser } from '../parser/vcd-parser.js';
 import { parseCheckerOutput } from '../parser/checker-parser.js';
 import {
@@ -86,6 +87,8 @@ export interface OrchestratorContext {
   loadState?: () => Promise<WorkflowState | null>;
   logLLMTrace?: (entry: LLMTraceEntry) => Promise<void>;
   readFile?: (relativePath: string) => Promise<string>;
+  /** Filelist path relative to project root */
+  filelistPath?: string;
   /** Abort signal for cancelling in-flight operations (Ctrl+C) */
   signal?: AbortSignal;
 }
@@ -94,6 +97,7 @@ export interface OrchestratorContext {
 // Constants
 // ---------------------------------------------------------------------------
 
+const DEFAULT_FILELIST = 'hw/src/filelist/design.f';
 const SAME_ERROR_MAX_RETRIES = 8;
 const TOTAL_ITERATION_CAP = 32;
 const MODULE_LINE_LIMIT = 1024;
@@ -102,6 +106,9 @@ const HISTORY_TRIM_TO = 20;
 const VCD_FALLBACK_THRESHOLD = 4;
 const LINT_ATTEMPT_CAP = 4;
 const VE_COMPILE_ATTEMPT_CAP = 4;
+const COMPILE_SAME_ERROR_CAP = 2;   // Same compile error → infrastructure
+const COMPILE_TOTAL_CAP = 5;        // Total compile fix rounds → infrastructure
+const INFRA_DEBUG_MAX_ROUNDS = 8;
 
 // v2 stage descriptions (no PM)
 const STAGE_DESCRIPTIONS: Record<StageId, string> = {
@@ -773,8 +780,10 @@ export class Orchestrator {
         // v3: Exclude top modules (auto-generated, no P2/RTL/UT needed)
         if (this.workflowState) {
           const topSet = new Set(this.phase1Output.topModules);
-          this.workflowState.moduleStatuses = this.phase1Output.dependencyOrder
-            .filter(name => !topSet.has(name) || !this.phase1Output!.topPorts?.length)
+          // Exclude auto-generated top modules, but keep them if they are the ONLY module
+          const depOrder = this.phase1Output.dependencyOrder;
+          this.workflowState.moduleStatuses = depOrder
+            .filter(name => depOrder.length === 1 || !topSet.has(name) || !this.phase1Output!.topPorts?.length)
             .map(name => ({
               name,
               file: `hw/src/hdl/${name}.v`,
@@ -849,9 +858,11 @@ export class Orchestrator {
 
         // ── RTL write ──
         yield* this.runRTLWrite(mod, context);
+        if ((mod.status as string) === 'failed' || (mod.status as string) === 'skipped') continue;
 
         // ── Lint ──
         yield* this.runLint(mod, context);
+        if ((mod.status as string) === 'failed' || (mod.status as string) === 'skipped') continue;
 
         // ── UT generation + simulation + debug loop ──
         yield* this.runUTWithDebugLoop(mod, context);
@@ -949,8 +960,17 @@ export class Orchestrator {
       ? getRelevantContracts(this.phase1Output.interfaceContracts, mod.name)
       : undefined;
 
+    let writeHadError = false;
     for await (const chunk of writeModule(ctx, phase2, depPorts, context.hdlStandard, contracts)) {
+      if (chunk.type === 'error') writeHadError = true;
       yield chunk;
+    }
+
+    // If RTL generation produced no code, stop the pipeline for this module
+    if (writeHadError) {
+      mod.status = 'failed';
+      await this.logWorkflow(context, 'RTL_WRITE', 'fail', `module=${mod.name} no_code`);
+      return;
     }
 
     // Module size check
@@ -1116,6 +1136,9 @@ export class Orchestrator {
     let consecutiveSimilarCheckerRounds = 0;
     let vcdEnabled = false;
     let vcdData: string | undefined;
+    let compileSameErrorCount = 0;
+    let compileTotalCount = 0;
+    let lastCompileError = '';
 
     // ── Spec-Checker Audit: conclusive diagnosis before guessing ──
     // Run once at the start of debug loop if we have P2 spec and TB code
@@ -1194,6 +1217,13 @@ export class Orchestrator {
 
       if (sameCount > SAME_ERROR_MAX_RETRIES) {
         yield* this.handleDebugExhausted(mod, context);
+        // If counters were reset (user chose retry/infrastructure resolved), re-enter loop
+        if (mod.status !== 'failed' && mod.status !== 'skipped' && mod.totalIterations === 0) {
+          errorCounts.clear();
+          lastNormalizedError = '';
+          consecutiveSimilarCheckerRounds = 0;
+          continue;
+        }
         return;
       }
 
@@ -1216,19 +1246,54 @@ export class Orchestrator {
         });
       }
 
-      // v3: Check for compile error → route to VE instead of Designer
+      // v3.1: Compile error → specific-role fix first, escalate to infrastructure
       if (this.isCompileError(currentError)) {
-        mod.veCompileAttempts++;
-        if (mod.veCompileAttempts > VE_COMPILE_ATTEMPT_CAP) {
-          yield { type: 'error', content: `VE compile fix exhausted for ${mod.name} after ${VE_COMPILE_ATTEMPT_CAP} attempts. Manual intervention required.` };
-          mod.status = 'failed';
-          return;
+        compileTotalCount++;
+        const normalizedCompile = this.normalizeError(currentError);
+        if (normalizedCompile === lastCompileError) {
+          compileSameErrorCount++;
+        } else {
+          compileSameErrorCount = 1;
+          lastCompileError = normalizedCompile;
         }
-        await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=VE_compile attempt=${mod.veCompileAttempts}`);
-        yield { type: 'status', content: `Compile error detected, routing to VE for fix (attempt ${mod.veCompileAttempts})...` };
-        const fixed = await fixCompileErrors(ctx, mod.name, currentError);
-        if (!fixed) {
-          yield { type: 'status', content: `VE compile fix produced no output for ${mod.name}` };
+
+        const shouldEscalate =
+          compileSameErrorCount > COMPILE_SAME_ERROR_CAP ||
+          compileTotalCount > COMPILE_TOTAL_CAP;
+
+        if (shouldEscalate) {
+          // Escalate to Infrastructure Debug Agent
+          await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=infra_debug_compile same=${compileSameErrorCount} total=${compileTotalCount}`);
+          yield { type: 'status', content: `Compile fix exhausted (same-error: ${compileSameErrorCount}, total: ${compileTotalCount}) — escalating to Infrastructure Debug Agent...` };
+
+          const infraGen = runInfraDebug(ctx, currentError, 'compile');
+          let infraResult;
+          while (true) {
+            const { value, done } = await infraGen.next();
+            if (done) {
+              infraResult = value;
+              break;
+            }
+            yield value;
+          }
+
+          if (!infraResult.resolved) {
+            yield { type: 'error', content: `Infrastructure Debug Agent could not resolve compile error for ${mod.name}. Manual intervention required.` };
+            mod.status = 'failed';
+            return;
+          }
+          // Infrastructure resolved it — reset compile counters and continue loop to re-sim
+          compileSameErrorCount = 0;
+          compileTotalCount = 0;
+        } else {
+          // Specific-role fix
+          mod.veCompileAttempts++;
+          await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=VE_compile attempt=${mod.veCompileAttempts} same=${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} total=${compileTotalCount}/${COMPILE_TOTAL_CAP}`);
+          yield { type: 'status', content: `Compile error detected, routing to VE for fix (${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} same, ${compileTotalCount}/${COMPILE_TOTAL_CAP} total)...` };
+          const fixed = await fixCompileErrors(ctx, mod.name, currentError);
+          if (!fixed) {
+            yield { type: 'status', content: `VE compile fix produced no output for ${mod.name}` };
+          }
         }
       } else {
         // Ask RTL Designer to diagnose and fix (or flag tb_suspect)
@@ -1434,14 +1499,21 @@ export class Orchestrator {
       }
     }
 
-    // Total cap exceeded
+    // Total cap exceeded — handle exhaustion, possibly re-enter if reset
     yield* this.handleDebugExhausted(mod, context);
+    if (mod.status !== 'failed' && mod.status !== 'skipped' && mod.totalIterations === 0) {
+      // Counters reset — re-enter debug loop by recursion (one level only)
+      yield* this.debugLoop(mod, currentError, context);
+    }
   }
 
   private async *handleDebugExhausted(
     mod: ModuleStatus,
     context: OrchestratorContext,
   ): AsyncGenerator<OutputChunk> {
+    const ctx = this.buildStageContext(context);
+    const phase2 = this.phase2Outputs.get(mod.name);
+
     // Show downstream dependencies
     let summary = `Module ${mod.name}: debug limit reached (${mod.totalIterations} iterations).\n`;
     if (this.designIndex) {
@@ -1452,6 +1524,7 @@ export class Orchestrator {
         summary += `  Downstream dependencies: ${deps.join(', ')}\n`;
       }
     }
+    summary += `  Debug history:\n${mod.debugHistory.map((h, i) => `    ${i + 1}. ${h}`).join('\n')}`;
     yield { type: 'status', content: summary };
 
     if (context.autoMode) {
@@ -1461,15 +1534,63 @@ export class Orchestrator {
     }
     if (context.askUser) {
       const answer = await context.askUser(
-        'Options: 1) Reset and continue  2) Skip module  3) Pause for manual intervention',
+        'Options:\n  1) Enable Infrastructure Debug (LLM will access both RTL and TB)\n  2) Reset and continue normal debug\n  3) Skip module\n  4) Pause for manual intervention',
       );
       const choice = answer.trim();
+
       if (choice === '1') {
+        // v3.1: Infrastructure Debug Agent for functional errors
+        await this.logWorkflow(context, 'INFRA_DEBUG', 'start', `module=${mod.name} mode=functional`);
+        yield { type: 'status', content: 'User authorized Infrastructure Debug — LLM will access both RTL and TB with spec as ground truth.' };
+
+        // Build spec context for the agent
+        const specParts: string[] = [];
+        if (phase2?.functionalSpec) specParts.push(`Functional Spec:\n${phase2.functionalSpec}`);
+        if (phase2?.utVerification) specParts.push(`Verification Requirements:\n${JSON.stringify(phase2.utVerification, null, 2)}`);
+        if (phase2?.fsmDescription) specParts.push(`FSM Description:\n${phase2.fsmDescription}`);
+        if (phase2?.timingNotes) specParts.push(`Timing Notes:\n${phase2.timingNotes}`);
+        const specStr = specParts.length > 0 ? specParts.join('\n\n') : 'No detailed spec available.';
+
+        // Get the last error for the agent
+        const lastError = mod.debugHistory.length > 0
+          ? `Module: ${mod.name}\nLast error:\n${mod.debugHistory[mod.debugHistory.length - 1]}`
+          : `Module: ${mod.name}\nDebug exhausted after ${mod.totalIterations} iterations.`;
+
+        const infraGen = runInfraDebug(ctx, lastError, 'functional', specStr);
+        let infraResult;
+        while (true) {
+          const { value, done } = await infraGen.next();
+          if (done) {
+            infraResult = value;
+            break;
+          }
+          yield value;
+        }
+
+        await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} rounds=${infraResult.toolRounds}`);
+
+        if (infraResult.resolved) {
+          yield { type: 'status', content: `Infrastructure Debug resolved the issue. Re-running simulation...` };
+          // Reset debug counters and re-enter debug loop by returning (caller will re-sim)
+          mod.sameErrorRetries = 0;
+          mod.totalIterations = 0;
+          mod.debugHistory.push(`[InfraDebug resolved] ${infraResult.summary.slice(0, 200)}`);
+          return;
+        }
+        yield { type: 'status', content: `Infrastructure Debug could not resolve: ${infraResult.summary.slice(0, 200)}` };
+        mod.debugHistory.push(`[InfraDebug failed] ${infraResult.summary.slice(0, 200)}`);
+        // Fall through to ask again
+        const retry = await context.askUser('Infrastructure Debug did not resolve the issue.\n  1) Skip module  2) Pause for manual intervention');
+        if (retry.trim() === '2') {
+          mod.status = 'failed';
+          yield { type: 'status', content: `Paused. Edit code manually, then use /continue to resume.` };
+          return;
+        }
+      } else if (choice === '2') {
         mod.sameErrorRetries = 0;
         mod.totalIterations = 0;
         return;
-      }
-      if (choice === '3') {
+      } else if (choice === '4') {
         mod.status = 'failed';
         yield { type: 'status', content: `Paused. Edit code manually, then use /continue to resume.` };
         return;
@@ -1881,6 +2002,7 @@ export class Orchestrator {
       },
       phase1Output: this.phase1Output ?? undefined,
       autoMode: context.autoMode,
+      filelistPath: context.filelistPath ?? DEFAULT_FILELIST,
       executeAction: context.executeAction
         ? (action: Action) => context.executeAction!(action)
         : async () => '',

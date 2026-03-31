@@ -306,37 +306,97 @@ Round 4: [current]
 
 ## Debug Loop
 
-### Primary: Checker-Based
+### **[v3.1]** Per-TC Execution
+- TCs run serially; on first failure, stop immediately and enter debug
+- Debug targets the specific failing TC (faster feedback, VCD matches the TC)
+- After fix, re-run that TC; if it passes, run full regression (all TCs)
+- Regression failure on a different TC → switch to debugging that TC
+
+### Primary: Checker-Based (functional errors)
 1. Simulation fails → checker output identifies signal, expected/actual values, timestamp
 2. RTL Designer receives: checker output + RTL code + module functional description + **[v3]** debug history summary
 3. Designer fixes RTL and returns `fix_summary` (one-line description), OR returns `{"diagnosis": "tb_suspect", "reason": "..."}`
 4. If tb_suspect → VE reviews TB with Designer's reason
-5. Re-lint → re-sim **all TCs** (regression)
+5. Re-sim failing TC → pass → regression
 
-### **[v3]** Simulation Compile Error (distinct from runtime test failure)
-- If TB/TC fails to compile (syntax error, undeclared signal, etc.):
-  - Route to **VE** for fix (VE wrote the TB/TC)
-  - NOT to RTL Designer (the RTL code passed lint)
-  - VE receives: compile error output + TB/TC code
-  - After fix → re-compile → continue to simulation
-  - Max **4** fix attempts; exceeding → user intervention
+### **[v3.1]** Compile Error Escalation
+Compile errors use a **two-tier** strategy: specific-role fix first, then infrastructure agent.
+
+**Tier 1 — Specific-role fix:**
+- Error points to RTL file → Designer fixes
+- Error points to TB/TC file → VE fixes
+- Error type unclear → skip to Tier 2
+- **Same-error cap: 2 rounds.** If same compile error persists after 2 rounds → Tier 2
+- Different error → reset same-error counter (making progress)
+- **Total cap: 5 rounds** across all compile errors → Tier 2
+
+**Tier 2 — Infrastructure Debug Agent** (see below):
+- Tool-calling agent with `list_files`, `read_file`, `write_file`, `run_command`
+- Can investigate and fix any project file (filelist, paths, include dirs, scripts, etc.)
+- No verification independence concern (compile errors are pre-simulation)
 
 ### Fallback: VCD-Based (when checker output insufficient)
 1. **[v3]** Triggered after 4 rounds of similar checker output with no progress
-2. VE modifies TB to add $dumpvars
-3. Re-simulate to generate VCD
-4. Static tool: extract relevant signals in time window
-5. Format as text table → give to Designer
+2. Deterministic insertion: add `$dumpfile`/`$dumpvars` to TB (no LLM needed)
+3. Immediate re-sim (failing TC only) to generate VCD
+4. **[v3.1]** Signal selection: if >25 signals, Designer LLM selects 10-25 relevant signals
+5. Timescale-aware extraction: convert checker error time (ns) to VCD time units
+6. Format as text table with checker errors → give to Designer
+
+### **[v3.1]** Functional Error Escalation
+When the normal debug loop is exhausted, escalate before giving up:
+
+```
+Designer debug loop (RTL only, independent)
+  → tb_suspect → VE independent review
+  → VCD fallback → Designer with waveform
+  → 8 same-error / 32 total → exhausted
+  → Spec-Checker Audit (VE compares spec vs TB checker logic independently)
+    → TB mismatch found → fix TB → re-enter debug loop
+    → TB confirmed correct → RTL bug confirmed
+  → Still stuck → **ask user**:
+    (1) Enable Infrastructure Debug (LLM sees both RTL and TB)
+    (2) Manual intervention
+  → User chooses (1) → Infrastructure Debug Agent
+    → spec is immutable ground truth in prompt
+    → can read/write all files + run simulation
+    → max 8 rounds
+    → still fails → user manual intervention
+```
+
+### **[v3.1]** Infrastructure Debug Agent
+A tool-calling agent for problems beyond the scope of specific-role fix.
+
+**Tools:**
+- `list_files(dir)` — list directory contents
+- `read_file(path)` — read any project file
+- `write_file(path, content)` — write any project file
+- `run_command(cmd)` — run lint/simulation commands
+
+**Prompt context (not via tools):**
+- The error output that triggered escalation
+- P2 spec (functionalSpec, utVerification) as **immutable ground truth**
+- Project file structure overview
+
+**Constraints:**
+- Max tool rounds: 8 (compile) / 8 (functional)
+- For functional debug: user must explicitly authorize (independence is broken)
+- Spec is anchor: "Fix code to match spec. Never modify spec or adjust expectations to match buggy behavior."
+- All operations logged for audit
+
+**Trigger conditions:**
+- Compile: specific-role fix failed (2 same-error or 5 total), or error type unclear
+- Functional: user authorizes after normal debug loop exhausted
 
 ### Iteration Limits
 - **[v3]** Lint fix: max **4** attempts per Designer invocation. Exceeding → discard and re-invoke Designer for a fresh rewrite. If fresh rewrite also fails 4 lint attempts → user intervention
-- **[v3]** VE compile error fix: max **4** attempts. Exceeding → user intervention
+- **[v3.1]** Compile error: same-error **2** rounds → infrastructure. Total **5** rounds → infrastructure
 - Same error (debug): max **8** retries
 - Different error: reset that error's counter
 - Total debug cap: **32**
-- **[v3]** Lint, VE compile, and debug counters are all independent
-- On exceeding debug limit: show fix history, show downstream dependencies, ask user:
-  1) Continue fixing  2) Skip module  3) Pause for manual intervention
+- **[v3.1]** Infrastructure debug: max **8** tool rounds
+- **[v3]** Lint, compile, and debug counters are all independent
+- On exceeding all limits: show fix history, show downstream dependencies, user manual intervention
 
 ## ST (System Test) Debug
 
@@ -436,12 +496,13 @@ During debug, a fix may require changing a module's port interface. Two cases:
 - No "magic numbers" — use parameters/localparams (from design_params.vh)
 - These rules are embedded in Designer's system prompt, not injected from prior code
 
-## **[v3]** Filelist Management
-- Single master filelist: `hw/src/filelist/design.f`
+## **[v3.1]** Filelist Management
+- Filelist(s) generated by Architect at P1 phase — LLM decides filelist names, structure, and initial content
+- There may be multiple filelists (e.g. RTL compilation, simulation, synthesis), Architect specifies purpose of each
+- Filelist name(s) stored in P1 output and project config — NOT hardcoded
 - Updated incrementally: append each new module file immediately after writing
-- Includes `+incdir+` for macro directory (`hw/src/macro/`)
-- Enables dependent modules to compile against predecessors
-- VE uses this filelist for all simulation commands
+- Includes `+incdir+` for macro/include directories
+- VE and BE reference filelists by name from project config
 - On module rewrite: filelist entry stays (same filename), file content replaced
 
 ## **[v3]** setenv Strategy

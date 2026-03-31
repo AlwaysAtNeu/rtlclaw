@@ -54,7 +54,7 @@ export async function* runBEStage(ctx: StageContext): AsyncGenerator<OutputChunk
   // --- Step 3: Generate synthesis script ---
   yield { type: 'progress', content: 'Generating synthesis script...' };
 
-  const synthScriptMsgs = buildBESynthScriptMessages(topModule, targetDevice);
+  const synthScriptMsgs = buildBESynthScriptMessages(topModule, targetDevice, ctx.filelistPath);
   const synthScriptResp = await ctx.llm.complete(synthScriptMsgs);
   const synthScriptContent = synthScriptResp.content;
 

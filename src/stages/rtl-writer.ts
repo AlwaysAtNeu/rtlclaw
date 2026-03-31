@@ -133,7 +133,7 @@ export async function* writeModule(
       await ctx.executeAction({
         type: 'writeFile',
         payload: {
-          path: 'hw/src/filelist/design.f',
+          path: ctx.filelistPath,
           content: filePath,
           append: true,
         },

@@ -431,8 +431,8 @@ export async function fixCompileErrors(
 
     // Read filelist if it exists
     try {
-      const filelist = await ctx.readFile('hw/src/filelist/design.f');
-      parts.push(`Design filelist (hw/src/filelist/design.f):\n${filelist}`);
+      const filelist = await ctx.readFile(ctx.filelistPath);
+      parts.push(`Design filelist (${ctx.filelistPath}):\n${filelist}`);
     } catch { /* ignore */ }
 
     // Try to read the RTL source file for reference

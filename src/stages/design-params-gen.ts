@@ -66,7 +66,7 @@ async function* generateVerilogDefines(
   await ctx.executeAction({
     type: 'writeFile',
     payload: {
-      path: 'hw/src/filelist/design.f',
+      path: ctx.filelistPath,
       content: '+incdir+hw/src/macro',
       append: true,
     },
@@ -109,7 +109,7 @@ async function* generateSVPackage(
   await ctx.executeAction({
     type: 'writeFile',
     payload: {
-      path: 'hw/src/filelist/design.f',
+      path: ctx.filelistPath,
       content: filePath,
       append: true,
     },
@@ -119,7 +119,7 @@ async function* generateSVPackage(
   await ctx.executeAction({
     type: 'writeFile',
     payload: {
-      path: 'hw/src/filelist/design.f',
+      path: ctx.filelistPath,
       content: '+incdir+hw/src/macro',
       append: true,
     },

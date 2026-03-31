@@ -315,8 +315,10 @@ async function executeAction(
   hdlStandard?: string,
   logTrace?: (entry: LLMTraceEntry) => Promise<void>,
   signal?: AbortSignal,
+  filelistPath?: string,
 ): Promise<string> {
   const baseDir = projectPath ?? process.cwd();
+  const flPath = filelistPath ?? 'hw/src/filelist/design.f';
 
   switch (action.type) {
     case 'writeFile': {
@@ -378,7 +380,7 @@ async function executeAction(
       let lintResult = '';
 
       // Use filelist for dependencies and include paths if available
-      const filelistPath = path.join(baseDir, 'hw/src/filelist/design.f');
+      const filelistPath = path.join(baseDir, flPath);
       const filelistArg = existsSync(filelistPath) ? ` -f ${filelistPath}` : '';
 
       try {
@@ -420,7 +422,7 @@ async function executeAction(
       // Find testbench and sources
       const tbDir = payload.testType === 'ut' ? 'hw/dv/ut/sim/tb' : 'hw/dv/st/sim/tb';
       const tcDir = payload.testType === 'ut' ? 'hw/dv/ut/sim/tc' : 'hw/dv/st/sim/tc';
-      const filelistPath = path.join(baseDir, 'hw/src/filelist/design.f');
+      const filelistPath = path.join(baseDir, flPath);
       const tbPath = path.join(baseDir, tbDir);
       const tcPath = path.join(baseDir, tcDir);
 
@@ -640,7 +642,7 @@ async function executeAction(
         // Use existing synth.ys if available, otherwise generate a basic one
         const ysPath = path.join(synDir, 'synth.ys');
         if (!existsSync(ysPath)) {
-          const filelistPath = path.join(baseDir, 'hw/src/filelist/design.f');
+          const filelistPath = path.join(baseDir, flPath);
           const topMod = synPayload.topModule ?? 'top';
           const ysScript = `# Auto-generated synthesis script\nread_verilog -f ${filelistPath}\nsynth -top ${topMod}\nstat\nwrite_verilog ${path.join(synDir, 'netlist.v')}\n`;
           await fs.writeFile(ysPath, ysScript, 'utf-8');
@@ -1581,7 +1583,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       targetDevice: configManager.config.project.targetDevice,
       signal: currentAbort?.signal,
       askUser,
-      executeAction: (action: Action) => executeAction(action, currentProjectPath, configManager.config.project.hdlStandard, context.logLLMTrace, currentAbort?.signal),
+      executeAction: (action: Action) => executeAction(action, currentProjectPath, configManager.config.project.hdlStandard, context.logLLMTrace, currentAbort?.signal, context.filelistPath),
     };
 
     // Add state management callbacks if in project mode

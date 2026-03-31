@@ -32,6 +32,8 @@ export interface StageContext {
   designIndex: DesignIndex;
   phase1Output?: ArchitectPhase1Output;
   autoMode: boolean;
+  /** Filelist path relative to project root */
+  filelistPath: string;
 
   /** Execute a project action (writeFile, lintCode, runSimulation, etc.) */
   executeAction: (action: Action) => Promise<string>;

@@ -32,7 +32,17 @@ export interface ProjectInfo {
   description?: string;
   hdlStandard?: string;
   targetDevice?: string;
+  /** Filelist path(s) relative to project root. Default: 'hw/src/filelist/design.f' */
+  filelistPath?: string;
   files: FileEntry[];
+}
+
+/** Default filelist path when not specified in project config */
+export const DEFAULT_FILELIST = 'hw/src/filelist/design.f';
+
+/** Get the filelist path for a project, falling back to default */
+export function getFilelistPath(info?: { filelistPath?: string }): string {
+  return info?.filelistPath ?? DEFAULT_FILELIST;
 }
 
 export interface ConversationEntry {
@@ -136,9 +146,9 @@ export class ProjectManager {
     }
 
     // Create empty filelist
-    const filelistPath = path.join(absRoot, 'hw/src/filelist/design.f');
-    if (!existsSync(filelistPath)) {
-      await fs.writeFile(filelistPath, '// RTL-Claw design filelist\n+incdir+../macro\n', 'utf-8');
+    const defaultFL = path.join(absRoot, DEFAULT_FILELIST);
+    if (!existsSync(defaultFL)) {
+      await fs.writeFile(defaultFL, '// RTL-Claw design filelist\n+incdir+../macro\n', 'utf-8');
     }
 
     const now = new Date().toISOString();
@@ -324,10 +334,12 @@ export class ProjectManager {
   // Filelist management
   // -----------------------------------------------------------------------
 
-  async appendToFilelist(rootPath: string, hdlFile: string): Promise<void> {
+  async appendToFilelist(rootPath: string, hdlFile: string, customFilelistPath?: string): Promise<void> {
     const absRoot = path.resolve(rootPath);
-    const filelistPath = path.join(absRoot, 'hw/src/filelist/design.f');
-    const relativePath = path.relative(path.join(absRoot, 'hw/src/filelist'), path.join(absRoot, hdlFile));
+    const flPath = customFilelistPath ?? DEFAULT_FILELIST;
+    const filelistPath = path.join(absRoot, flPath);
+    const filelistDir = path.dirname(filelistPath);
+    const relativePath = path.relative(filelistDir, path.join(absRoot, hdlFile));
 
     try {
       const content = await fs.readFile(filelistPath, 'utf-8');

@@ -604,6 +604,7 @@ Design:\n${formatDesignIndexBrief(designIndex)}`,
 export function buildBESynthScriptMessages(
   topModule: string,
   targetDevice: string,
+  filelistPath = 'hw/src/filelist/design.f',
 ): Message[] {
   return [
     { role: 'system', content: BE_PROMPT },
@@ -613,7 +614,7 @@ export function buildBESynthScriptMessages(
 
 Top module: ${topModule}
 Target: ${targetDevice}
-Design filelist: hw/src/filelist/design.f
+Design filelist: ${filelistPath}
 Constraints: hw/syn/constraints.sdc
 
 Write a Yosys script at hw/syn/synth.ys that:
