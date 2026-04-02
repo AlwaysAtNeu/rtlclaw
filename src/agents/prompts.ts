@@ -131,7 +131,15 @@ The JSON MUST include:
    - These will be auto-generated into a design_params.vh/pkg file
    - Omit or set to {} if no shared parameters are needed
 
-8. (Optional) clockDomains, resetStrategy, pipelineStages
+8. **filelists**: Array of filelist specifications for the project:
+   - Each entry: {name, path, purpose, description, initialContent?}
+   - purpose: "rtl" (source compilation), "simulation" (sim with TB), "synthesis", or "other"
+   - path: relative path (e.g., "hw/src/filelist/rtl.f")
+   - initialContent: (optional) initial lines like \`+incdir+hw/src/macro\` — module source files will be appended automatically later
+   - At minimum, provide one RTL filelist; add simulation/synthesis filelists if the design needs separate file sets
+   - Example: [{"name": "rtl", "path": "hw/src/filelist/rtl.f", "purpose": "rtl", "description": "RTL source files", "initialContent": ["+incdir+hw/src/macro"]}]
+
+9. (Optional) clockDomains, resetStrategy, pipelineStages
 
 Design rules:
 - snake_case for all names
@@ -219,6 +227,8 @@ You will receive:
 - Checker error output (signal, expected value, actual value, timestamp)
 - Your RTL source code
 - Module functional description
+- Previous fix attempts (if any) — learn from them, do NOT repeat the same fix
+- VCD waveform data (if available) — use signal values over time to trace the bug
 
 Analyze the error and either:
 1. Fix the RTL code — FIRST output a fix summary JSON, then the corrected file:
@@ -564,6 +574,25 @@ export const ARCHITECT_TOOL_SCHEMA = {
             { type: 'number' as const },
             { type: 'string' as const },
           ],
+        },
+      },
+      filelists: {
+        type: 'array' as const,
+        description: 'Filelist specifications — at least one RTL filelist required',
+        items: {
+          type: 'object' as const,
+          properties: {
+            name: { type: 'string' as const, description: 'Filelist identifier (e.g., "rtl", "sim")' },
+            path: { type: 'string' as const, description: 'Relative file path (e.g., "hw/src/filelist/rtl.f")' },
+            purpose: { type: 'string' as const, enum: ['rtl', 'simulation', 'synthesis', 'other'] },
+            description: { type: 'string' as const },
+            initialContent: {
+              type: 'array' as const,
+              items: { type: 'string' as const },
+              description: 'Initial lines (e.g., +incdir+ directives). Module files appended later.',
+            },
+          },
+          required: ['name', 'path', 'purpose', 'description'],
         },
       },
     },

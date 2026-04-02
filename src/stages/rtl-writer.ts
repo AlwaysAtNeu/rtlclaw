@@ -73,13 +73,14 @@ export async function* writeModule(
   dependentModulePorts: Array<{ name: string; ports: PortDef[] }>,
   hdlStandard?: string,
   interfaceContracts?: InterfaceContract[],
+  previousLintError?: string,
 ): AsyncGenerator<OutputChunk> {
   const moduleName = phase2Design.moduleName;
 
   yield { type: 'status', content: `Writing RTL for module "${moduleName}"...` };
 
   // Build messages and call LLM (v3: pass interface contracts)
-  const messages = buildRTLWriteMessages(phase2Design, dependentModulePorts, hdlStandard, interfaceContracts);
+  const messages = buildRTLWriteMessages(phase2Design, dependentModulePorts, hdlStandard, interfaceContracts, previousLintError);
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages);
   const durationMs = Date.now() - startMs;

@@ -8,6 +8,20 @@
 import type { ArchitectPhase1Output } from '../agents/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 
+/** Append +incdir+ to filelist only if not already present. */
+async function appendIncdirIfNeeded(ctx: StageContext, dir: string): Promise<void> {
+  const incdirLine = `+incdir+${dir}`;
+  try {
+    const existing = await ctx.readFile(ctx.filelistPath);
+    if (existing.includes(incdirLine)) return; // Already present
+  } catch { /* filelist doesn't exist yet, proceed */ }
+
+  await ctx.executeAction({
+    type: 'writeFile',
+    payload: { path: ctx.filelistPath, content: incdirLine, append: true },
+  });
+}
+
 /**
  * Generate design_params file and append include dir to filelist.
  */
@@ -62,15 +76,8 @@ async function* generateVerilogDefines(
 
   yield { type: 'progress', content: `Generated ${filePath} (${Object.keys(params).length} parameters)` };
 
-  // Append +incdir+ to filelist
-  await ctx.executeAction({
-    type: 'writeFile',
-    payload: {
-      path: ctx.filelistPath,
-      content: '+incdir+hw/src/macro',
-      append: true,
-    },
-  });
+  // Append +incdir+ to filelist (skip if already present from Architect's initialContent)
+  await appendIncdirIfNeeded(ctx, 'hw/src/macro');
 
   yield { type: 'status', content: 'Design parameters file generated (Verilog `define format).' };
 }
@@ -115,15 +122,8 @@ async function* generateSVPackage(
     },
   });
 
-  // Also add incdir for any `include usage
-  await ctx.executeAction({
-    type: 'writeFile',
-    payload: {
-      path: ctx.filelistPath,
-      content: '+incdir+hw/src/macro',
-      append: true,
-    },
-  });
+  // Also add incdir for any `include usage (skip if already present)
+  await appendIncdirIfNeeded(ctx, 'hw/src/macro');
 
   yield { type: 'status', content: 'Design parameters file generated (SystemVerilog package format).' };
 }

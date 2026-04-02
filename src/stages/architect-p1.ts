@@ -19,6 +19,7 @@ import type {
   InterfaceContractSignal,
   TopPort,
   GlobalParameters,
+  FilelistSpec,
 } from '../agents/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 import {
@@ -239,6 +240,30 @@ function validatePhase1Output(raw: unknown): ArchitectPhase1Output {
     if (Object.keys(gp).length > 0) {
       result.globalParameters = gp;
     }
+  }
+
+  // v3.1: Filelists
+  if (Array.isArray(obj.filelists)) {
+    result.filelists = (obj.filelists as unknown[])
+      .filter((fl): fl is Record<string, unknown> =>
+        typeof fl === 'object' && fl !== null &&
+        typeof (fl as Record<string, unknown>).name === 'string' &&
+        typeof (fl as Record<string, unknown>).path === 'string')
+      .map((fl) => {
+        const spec: FilelistSpec = {
+          name: fl.name as string,
+          path: fl.path as string,
+          purpose: (['rtl', 'simulation', 'synthesis', 'other'].includes(fl.purpose as string)
+            ? fl.purpose as FilelistSpec['purpose']
+            : 'rtl'),
+          description: (fl.description as string) ?? '',
+        };
+        if (Array.isArray(fl.initialContent)) {
+          spec.initialContent = (fl.initialContent as unknown[])
+            .filter((line): line is string => typeof line === 'string');
+        }
+        return spec;
+      });
   }
 
   return result;
@@ -833,6 +858,15 @@ export function formatArchitectureSummary(phase1: ArchitectPhase1Output): string
     lines.push('Global parameters:');
     for (const [key, value] of Object.entries(phase1.globalParameters)) {
       lines.push(`  ${key} = ${value}`);
+    }
+  }
+
+  // v3.1: Filelists
+  if (phase1.filelists?.length) {
+    lines.push('');
+    lines.push('Filelists:');
+    for (const fl of phase1.filelists) {
+      lines.push(`  ${fl.path} (${fl.purpose}) — ${fl.description}`);
     }
   }
 

@@ -186,6 +186,7 @@ export function buildRTLWriteMessages(
   dependentModulePorts: Array<{ name: string; ports: PortDef[] }>,
   hdlStandard?: string,
   interfaceContracts?: InterfaceContract[],
+  previousLintError?: string,
 ): Message[] {
   let prompt = RTL_DESIGNER_PROMPT;
   if (hdlStandard) {
@@ -217,6 +218,11 @@ ${phase2Design.functionalSpec}`;
   // v3: Include relevant interface contracts
   if (interfaceContracts?.length) {
     userContent += `\n\nInterface contracts (define protocol/timing for this module's connections):\n${formatInterfaceContracts(interfaceContracts)}`;
+  }
+
+  // Previous lint error context (for fresh rewrite after lint failures)
+  if (previousLintError) {
+    userContent += `\n\nIMPORTANT: A previous attempt to write this module failed lint with the following error. Avoid this issue:\n${previousLintError.slice(0, 1000)}`;
   }
 
   return [
@@ -349,6 +355,7 @@ export function buildVEUnitTBMessages(
   utVerificationReqs: string,
   interfaceContracts?: InterfaceContract[],
   p2Spec?: { functionalSpec?: string; fsmDescription?: string; timingNotes?: string; boundaryConditions?: string[] },
+  globalParameters?: Record<string, number | string>,
 ): Message[] {
   let userContent = `Generate unit testbench and test cases for module "${moduleName}".
 
@@ -381,6 +388,12 @@ ${utVerificationReqs}`;
     userContent += `\n\nInterface contracts (add protocol checkers for these interfaces):\n${formatInterfaceContracts(interfaceContracts)}`;
   }
 
+  // Global parameters — use these instead of hardcoding values
+  if (globalParameters && Object.keys(globalParameters).length > 0) {
+    const paramLines = Object.entries(globalParameters).map(([k, v]) => `  ${k} = ${v}`).join('\n');
+    userContent += '\n\nGlobal parameters (use parameter names from design_params, do NOT hardcode values):\n' + paramLines;
+  }
+
   return [
     { role: 'system', content: VE_UT_PROMPT },
     { role: 'user', content: userContent },
@@ -396,6 +409,7 @@ export function buildVETBReviewMessages(
   designerReason: string,
   tbCode: string,
   verificationReqs: string,
+  functionalSpec?: string,
 ): Message[] {
   return [
     { role: 'system', content: VE_TB_REVIEW_PROMPT },
@@ -411,7 +425,7 @@ ${tbCode}
 \`\`\`
 
 Verification requirements (from Architect):
-${verificationReqs}`,
+${verificationReqs}${functionalSpec ? `\n\nFunctional specification (from Architect P2):\n${functionalSpec}` : ''}`,
     },
   ];
 }
@@ -425,6 +439,7 @@ export function buildVESystemTBMessages(
   allModulePorts: Array<{ name: string; ports: PortDef[] }>,
   topModuleName: string,
   interfaceContracts?: InterfaceContract[],
+  globalParameters?: Record<string, number | string>,
 ): Message[] {
   const moduleInfo = allModulePorts.map(m =>
     `${m.name}:\n${formatPortDefs(m.ports)}`
@@ -441,6 +456,12 @@ ${moduleInfo}`;
   // v3: Include all interface contracts for protocol verification
   if (interfaceContracts?.length) {
     userContent += `\n\nInterface contracts (add protocol checkers for inter-module interfaces):\n${formatInterfaceContracts(interfaceContracts)}`;
+  }
+
+  // Global parameters — use these instead of hardcoding values
+  if (globalParameters && Object.keys(globalParameters).length > 0) {
+    const paramLines = Object.entries(globalParameters).map(([k, v]) => `  ${k} = ${v}`).join('\n');
+    userContent += '\n\nGlobal parameters (use parameter names from design_params, do NOT hardcode values):\n' + paramLines;
   }
 
   return [

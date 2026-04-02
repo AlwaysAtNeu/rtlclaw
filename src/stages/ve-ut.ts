@@ -9,7 +9,7 @@
  * definitions and verification requirements from the Architect.
  */
 
-import type { PortDef } from '../agents/types.js';
+import type { PortDef, InterfaceContract } from '../agents/types.js';
 import type { Message } from '../llm/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 import {
@@ -95,13 +95,15 @@ export async function* generateUTTestbench(
   portDefs: PortDef[],
   utVerificationReqs: string,
   p2Spec?: { functionalSpec?: string; fsmDescription?: string; timingNotes?: string; boundaryConditions?: string[] },
+  interfaceContracts?: InterfaceContract[],
+  globalParameters?: Record<string, number | string>,
 ): AsyncGenerator<OutputChunk> {
   yield {
     type: 'status',
     content: `[VE-UT] Generating unit testbench for ${moduleName}...`,
   };
 
-  const messages = buildVEUnitTBMessages(moduleName, portDefs, utVerificationReqs, undefined, p2Spec);
+  const messages = buildVEUnitTBMessages(moduleName, portDefs, utVerificationReqs, interfaceContracts, p2Spec, globalParameters);
 
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages, { temperature: 0.2 });
@@ -226,6 +228,7 @@ export async function reviewTB(
   moduleName: string,
   designerReason: string,
   verificationReqs: string,
+  functionalSpec?: string,
 ): Promise<{ tbCorrect: boolean; fixedTBPath?: string; reason?: string }> {
   // Read current TB — try .sv first, then .v
   const tbPathSV = `hw/dv/ut/sim/tb/tb_${moduleName}.sv`;
@@ -246,6 +249,7 @@ export async function reviewTB(
     designerReason,
     tbCode,
     verificationReqs,
+    functionalSpec,
   );
 
   const startMs = Date.now();

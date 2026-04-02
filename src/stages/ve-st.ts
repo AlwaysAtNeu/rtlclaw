@@ -29,6 +29,7 @@ export async function* generateSTTestbench(
   allModulePorts: Array<{ name: string; ports: PortDef[] }>,
   topModuleName: string,
   interfaceContracts?: InterfaceContract[],
+  globalParameters?: Record<string, number | string>,
 ): AsyncGenerator<OutputChunk> {
   yield {
     type: 'status',
@@ -40,6 +41,7 @@ export async function* generateSTTestbench(
     allModulePorts,
     topModuleName,
     interfaceContracts,
+    globalParameters,
   );
 
   const startMs = Date.now();

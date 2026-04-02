@@ -251,11 +251,11 @@ Each agent call receives ONLY the context it needs:
 | RTL Designer (lint fix) | Lint error output + current RTL code |
 | RTL Designer (debug fix) | Checker error output + current RTL code + module functional description + **[v3]** debug history summary |
 | RTL Designer (tb_suspect) | Above + Architect's verification requirements (only when questioning TB) |
-| VE (generate UT TB+TC) | Module port definitions + Phase 2 functional spec (functionalSpec, FSM, timing, boundary conditions) + UT verification requirements + **[v3]** relevant interface contracts (NO RTL code — black-box) |
+| VE (generate UT TB+TC) | Module port definitions + Phase 2 functional spec (functionalSpec, FSM, timing, boundary conditions) + UT verification requirements + **[v3]** relevant interface contracts + global parameters (NO RTL code — black-box) |
 | **[v3]** VE (fix compile error) | Compile error output + TB/TC code |
 | **[v3.1]** Spec-Checker Audit | Phase 2 functional spec + TB checker code + checker failure output → conclusive judgment (checker correct or mismatch) |
-| VE (review TB after tb_suspect) | Designer's reason + TB code + verification requirements |
-| VE (generate ST TB+TC) | Phase 1 ST verification requirements + all module ports + top module structure + **[v3]** all interface contracts |
+| VE (review TB after tb_suspect) | Designer's reason + TB code + verification requirements + functional spec |
+| VE (generate ST TB+TC) | Phase 1 ST verification requirements + all module ports + top module structure + **[v3]** all interface contracts + global parameters |
 | **[v3]** Designer (ST triage) | ST checker error + auto-generated top module code + relevant sub-module port definitions |
 | BE (constraints + synthesis) | Design index (all modules) + target device (ask user) |
 | BE (timing analysis) | Synthesis report + design index |
@@ -316,8 +316,9 @@ Round 4: [current]
 1. Simulation fails → checker output identifies signal, expected/actual values, timestamp
 2. RTL Designer receives: checker output + RTL code + module functional description + **[v3]** debug history summary
 3. Designer fixes RTL and returns `fix_summary` (one-line description), OR returns `{"diagnosis": "tb_suspect", "reason": "..."}`
-4. If tb_suspect → VE reviews TB with Designer's reason
-5. Re-sim failing TC → pass → regression
+4. If fix → **re-lint** (catch syntax errors before simulation) → if lint error, Designer fixes
+5. If tb_suspect → VE reviews TB with Designer's reason + functional spec. **Cap: 3 tb_suspect per module** — after cap, VE review skipped, Designer forced to focus on RTL
+6. Re-sim failing TC → pass → regression
 
 ### **[v3.1]** Compile Error Escalation
 Compile errors use a **two-tier** strategy: specific-role fix first, then infrastructure agent.
@@ -347,16 +348,23 @@ Compile errors use a **two-tier** strategy: specific-role fix first, then infras
 When the normal debug loop is exhausted, escalate before giving up:
 
 ```
+**Spec-Checker Audit (FIRST, before debug loop, max 2 rounds)**
+  → VE compares spec vs TB checker logic independently (one LLM call)
+  → TB mismatch found → fix TB → re-simulate
+    → pass → done (no debug loop needed)
+    → fail → re-audit (round 2) to verify VE's fix didn't break other checkers
+    → If audit and VE disagree (audit says wrong, VE says correct) → skip re-audit, proceed to debug loop
+  → TB confirmed correct → RTL bug confirmed, enter debug loop
+
 Designer debug loop (RTL only, independent)
   → tb_suspect → VE independent review
   → VCD fallback → Designer with waveform
   → 8 same-error / 32 total → exhausted
-  → Spec-Checker Audit (VE compares spec vs TB checker logic independently)
-    → TB mismatch found → fix TB → re-enter debug loop
-    → TB confirmed correct → RTL bug confirmed
-  → Still stuck → **ask user**:
+  → **ask user**:
     (1) Enable Infrastructure Debug (LLM sees both RTL and TB)
-    (2) Manual intervention
+    (2) Reset and continue
+    (3) Skip module
+    (4) Manual intervention
   → User chooses (1) → Infrastructure Debug Agent
     → spec is immutable ground truth in prompt
     → can read/write all files + run simulation
@@ -389,7 +397,7 @@ A tool-calling agent for problems beyond the scope of specific-role fix.
 - Functional: user authorizes after normal debug loop exhausted
 
 ### Iteration Limits
-- **[v3]** Lint fix: max **4** attempts per Designer invocation. Exceeding → discard and re-invoke Designer for a fresh rewrite. If fresh rewrite also fails 4 lint attempts → user intervention
+- **[v3]** Lint fix: max **4** attempts per Designer invocation. Exceeding → discard and re-invoke Designer for a fresh rewrite (previous lint error passed as negative context). If fresh rewrite also fails 4 lint attempts → Infrastructure Debug Agent (handles non-RTL lint sources like design_params.vh, filelist, dependency ports). Infrastructure also fails → user intervention
 - **[v3.1]** Compile error: same-error **2** rounds → infrastructure. Total **5** rounds → infrastructure
 - Same error (debug): max **8** retries
 - Different error: reset that error's counter
@@ -420,7 +428,7 @@ Returns one of:
 ```
 
 ### Routing based on triage
-- **module** → enter that module's debug loop (same as UT debug)
+- **module** → enter that module's debug loop (same as UT debug). Triage diagnosis is prepended to the error output so Designer has localized context
 - **connection** → Architect P1 revision to fix interface contract → re-generate top module → re-run ST
 - **unknown** → VCD fallback (VE adds $dumpvars to ST TB) → Designer re-analyzes with waveform data
 

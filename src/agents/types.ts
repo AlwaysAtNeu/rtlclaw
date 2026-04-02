@@ -181,6 +181,22 @@ export interface ArchitectPhase1Output {
   topPorts?: TopPort[];
   /** v3: Global design parameters for design_params.vh generation */
   globalParameters?: GlobalParameters;
+  /** v3.1: Filelist(s) defined by Architect — names, paths, purposes, initial content */
+  filelists?: FilelistSpec[];
+}
+
+/** v3.1: Filelist specification from Architect P1 */
+export interface FilelistSpec {
+  /** Filelist name identifier (e.g., "rtl", "sim") */
+  name: string;
+  /** Relative path within project (e.g., "hw/src/filelist/rtl.f") */
+  path: string;
+  /** Purpose of this filelist */
+  purpose: 'rtl' | 'simulation' | 'synthesis' | 'other';
+  /** Brief description */
+  description: string;
+  /** Initial content lines (e.g., +incdir+ directives) — module files are appended later */
+  initialContent?: string[];
 }
 
 // ---------------------------------------------------------------------------

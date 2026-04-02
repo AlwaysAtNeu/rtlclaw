@@ -109,6 +109,7 @@ const VE_COMPILE_ATTEMPT_CAP = 4;
 const COMPILE_SAME_ERROR_CAP = 2;   // Same compile error → infrastructure
 const COMPILE_TOTAL_CAP = 5;        // Total compile fix rounds → infrastructure
 const INFRA_DEBUG_MAX_ROUNDS = 8;
+const TB_SUSPECT_CAP = 3;           // Max tb_suspect per module before forcing RTL focus
 
 // v2 stage descriptions (no PM)
 const STAGE_DESCRIPTIONS: Record<StageId, string> = {
@@ -784,9 +785,11 @@ export class Orchestrator {
           const depOrder = this.phase1Output.dependencyOrder;
           this.workflowState.moduleStatuses = depOrder
             .filter(name => depOrder.length === 1 || !topSet.has(name) || !this.phase1Output!.topPorts?.length)
-            .map(name => ({
+            .map(name => {
+              const ext = context.hdlStandard?.startsWith('sv') ? '.sv' : '.v';
+              return {
               name,
-              file: `hw/src/hdl/${name}.v`,
+              file: `hw/src/hdl/${name}${ext}`,
               lintPassed: false,
               utPassed: false,
               sameErrorRetries: 0,
@@ -796,7 +799,23 @@ export class Orchestrator {
               lintAttempts: 0,
               veCompileAttempts: 0,
               debugHistory: [],
-            }));
+            };});
+        }
+
+        // v3.1: Create primary filelist from Architect P1 output
+        if (context.executeAction && this.phase1Output.filelists?.length) {
+          const primaryFilelist = this.phase1Output.filelists.find(f => f.purpose === 'rtl')
+            ?? this.phase1Output.filelists[0];
+          context.filelistPath = primaryFilelist.path;
+
+          const content = primaryFilelist.initialContent?.join('\n') ?? '';
+          try {
+            await context.executeAction({
+              type: 'writeFile',
+              payload: { path: primaryFilelist.path, content: content ? content + '\n' : '' },
+            });
+            yield { type: 'progress', content: `Created filelist: ${primaryFilelist.path}` };
+          } catch { /* best-effort */ }
         }
 
         // Persist design index
@@ -978,7 +997,7 @@ export class Orchestrator {
     await this.logWorkflow(context, 'RTL_WRITE', 'done', `module=${mod.name} file=${mod.file}`);
   }
 
-  // ── Lint (v3: 4 attempts → fresh rewrite → 4 more → user intervention) ──
+  // ── Lint (4 → fresh rewrite → 4 → infrastructure → give up) ──
 
   private async *runLint(
     mod: ModuleStatus,
@@ -994,6 +1013,7 @@ export class Orchestrator {
     yield { type: 'progress', content: `Linting ${mod.name}...` };
 
     const ctx = this.buildStageContext(context);
+    let lastLintResult = '';  // For fresh-rewrite context (#2b)
 
     while (mod.lintAttempts < LINT_ATTEMPT_CAP * 2) {
       let lintResult: string;
@@ -1008,7 +1028,10 @@ export class Orchestrator {
         return;
       }
 
-      if (!lintResult.includes('error') && !lintResult.includes('Error')) {
+      // Check for actual errors — avoid false positives from "0 error(s)" or "No errors"
+      const hasLintError = /\berror\b/i.test(lintResult) &&
+        !/\b0\s+error/i.test(lintResult) && !/no\s+error/i.test(lintResult);
+      if (!hasLintError) {
         await this.logWorkflow(context, 'LINT', 'done', `module=${mod.name} clean attempt=${mod.lintAttempts}`);
         yield { type: 'status', content: `Lint passed: ${mod.name}` };
         mod.lintPassed = true;
@@ -1016,23 +1039,43 @@ export class Orchestrator {
       }
 
       mod.lintAttempts++;
+      lastLintResult = lintResult;
 
-      // After first 4 attempts, trigger fresh Designer rewrite
+      // After first 4 attempts, trigger fresh Designer rewrite with lint error context
       if (mod.lintAttempts === LINT_ATTEMPT_CAP) {
         yield { type: 'status', content: `Lint fix failed ${LINT_ATTEMPT_CAP} times for ${mod.name}, requesting fresh rewrite...` };
         const phase2 = this.phase2Outputs.get(mod.name);
         if (phase2) {
           const depPorts = this.getDependentModulePorts(mod.name);
-          for await (const chunk of writeModule(ctx, phase2, depPorts, context.hdlStandard)) {
+          for await (const chunk of writeModule(ctx, phase2, depPorts, context.hdlStandard, undefined, lastLintResult)) {
             yield chunk;
           }
         }
         continue;
       }
 
-      // After 8 total attempts, user intervention
+      // After 8 total attempts, escalate to infrastructure as last resort
       if (mod.lintAttempts >= LINT_ATTEMPT_CAP * 2) {
-        yield { type: 'error', content: `Lint fix exhausted for ${mod.name} after ${mod.lintAttempts} attempts. Manual intervention required.` };
+        await this.logWorkflow(context, 'LINT', 'start', `module=${mod.name} route=infra_debug_lint attempts=${mod.lintAttempts}`);
+        yield { type: 'status', content: `Lint fix exhausted after ${mod.lintAttempts} attempts — escalating to Infrastructure Debug Agent...` };
+
+        const infraGen = runInfraDebug(ctx, lintResult, 'compile');
+        let infraResult;
+        while (true) {
+          const { value, done } = await infraGen.next();
+          if (done) {
+            infraResult = value;
+            break;
+          }
+          yield value;
+        }
+
+        if (infraResult.resolved) {
+          // Infrastructure resolved — re-lint (don't reset lintAttempts to prevent infinite loop)
+          yield { type: 'status', content: `Infrastructure resolved lint issue. Re-linting ${mod.name}...` };
+          continue;
+        }
+        yield { type: 'error', content: `Lint fix exhausted for ${mod.name}. Manual intervention required.` };
         mod.lintPassed = false;
         return;
       }
@@ -1079,7 +1122,14 @@ export class Orchestrator {
       boundaryConditions: phase2.boundaryConditions,
     } : undefined;
 
-    for await (const chunk of generateUTTestbench(ctx, mod.name, modDef.ports, utReqs, p2Spec)) {
+    // v3: Pass relevant interface contracts so VE can write protocol checkers
+    const contracts = this.phase1Output?.interfaceContracts
+      ? getRelevantContracts(this.phase1Output.interfaceContracts, mod.name)
+      : undefined;
+
+    const globalParams = this.phase1Output?.globalParameters;
+
+    for await (const chunk of generateUTTestbench(ctx, mod.name, modDef.ports, utReqs, p2Spec, contracts, globalParams)) {
       yield chunk;
     }
 
@@ -1140,74 +1190,81 @@ export class Orchestrator {
     let compileTotalCount = 0;
     let lastCompileError = '';
 
-    // ── Spec-Checker Audit: conclusive diagnosis before guessing ──
-    // Run once at the start of debug loop if we have P2 spec and TB code
+    // ── Spec-Checker Audit: conclusive diagnosis before guessing (max 2 rounds) ──
     let auditResult: SpecCheckerAuditResult | undefined;
     if (phase2?.functionalSpec && !this.isCompileError(currentError)) {
-      try {
-        await this.logWorkflow(context, 'SPEC_AUDIT', 'start', `module=${mod.name}`);
-        // Read TB code for audit
-        const tbPath = `hw/dv/ut/sim/tb/tb_${mod.name}.sv`;
-        let tbCode = '';
+      const MAX_AUDIT_ROUNDS = 2;
+      for (let auditRound = 0; auditRound < MAX_AUDIT_ROUNDS; auditRound++) {
         try {
-          tbCode = await ctx.readFile(tbPath);
-        } catch {
+          await this.logWorkflow(context, 'SPEC_AUDIT', 'start', `module=${mod.name} round=${auditRound + 1}`);
+          // Read TB code for audit (re-read each round — VE may have fixed it)
+          const tbPath = `hw/dv/ut/sim/tb/tb_${mod.name}.sv`;
+          let tbCode = '';
           try {
-            tbCode = await ctx.readFile(tbPath.replace('.sv', '.v'));
-          } catch { /* no TB to audit */ }
-        }
+            tbCode = await ctx.readFile(tbPath);
+          } catch {
+            try {
+              tbCode = await ctx.readFile(tbPath.replace('.sv', '.v'));
+            } catch { /* no TB to audit */ }
+          }
 
-        if (tbCode) {
+          if (!tbCode) break;
+
           auditResult = await auditSpecVsChecker(
             ctx, mod.name, phase2.functionalSpec, tbCode, currentError,
           );
           const verdict = auditResult.checkerCorrect ? 'checker_correct→fix_rtl' : 'checker_wrong→fix_tb';
-          await this.logWorkflow(context, 'SPEC_AUDIT', 'done', `module=${mod.name} ${verdict}`);
+          await this.logWorkflow(context, 'SPEC_AUDIT', 'done', `module=${mod.name} ${verdict} round=${auditRound + 1}`);
           yield {
             type: 'status',
-            content: `[Spec Audit] ${auditResult.checkerCorrect ? 'Checker logic matches spec → RTL needs fix' : `Checker mismatch: ${auditResult.mismatch?.slice(0, 200)}`}`,
+            content: `[Spec Audit ${auditRound + 1}] ${auditResult.checkerCorrect ? 'Checker logic matches spec → RTL needs fix' : `Checker mismatch: ${auditResult.mismatch?.slice(0, 200)}`}`,
           };
 
-          // Record audit conclusion in debug history
           mod.debugHistory.push(
-            `[Spec Audit] ${auditResult.recommendation}: ${auditResult.analysis.slice(0, 300)}`,
+            `[Spec Audit ${auditRound + 1}] ${auditResult.recommendation}: ${auditResult.analysis.slice(0, 300)}`,
           );
 
-          // If checker is wrong, fix TB immediately instead of entering guess loop
-          if (!auditResult.checkerCorrect && auditResult.recommendation === 'fix_tb') {
-            yield { type: 'status', content: `Spec audit found TB checker error. Routing to VE for fix...` };
-            const reviewResult = await reviewTB(
-              ctx, mod.name,
-              `Spec audit found: ${auditResult.mismatch ?? auditResult.analysis}`,
-              phase2.utVerification ? JSON.stringify(phase2.utVerification) : '',
-            );
-            if (!reviewResult.tbCorrect) {
-              mod.debugHistory.push(`[VE fixed TB after audit] ${reviewResult.reason?.slice(0, 300) ?? ''}`);
-              yield { type: 'status', content: `VE fixed TB based on audit: ${reviewResult.fixedTBPath}` };
-            }
-            // Re-simulate after TB fix
-            if (context.executeAction) {
-              const reSimResult = await context.executeAction({
-                type: 'runSimulation',
-                payload: { module: mod.name, testType: 'ut', regression: true },
-              });
-              if (reSimResult.includes('TEST PASSED') || reSimResult.includes('PASSED')) {
-                mod.utPassed = true;
-                mod.status = 'done';
-                await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} RESOLVED by spec audit`);
-                yield { type: 'status', content: `Debug resolved for ${mod.name} — TB checker was incorrect (fixed by spec audit)` };
-                return;
-              }
-              // TB fix didn't fully resolve — continue to normal debug loop with updated error
-              currentError = reSimResult;
-              lastNormalizedError = this.normalizeError(reSimResult);
-              errorCounts.set(lastNormalizedError, 1);
-            }
+          // Checker correct → no TB fix needed, proceed to debug loop
+          if (auditResult.checkerCorrect || auditResult.recommendation !== 'fix_tb') break;
+
+          // Checker wrong → fix TB
+          yield { type: 'status', content: `Spec audit found TB checker error. Routing to VE for fix...` };
+          const reviewResult = await reviewTB(
+            ctx, mod.name,
+            `Spec audit found: ${auditResult.mismatch ?? auditResult.analysis}`,
+            phase2.utVerification ? JSON.stringify(phase2.utVerification) : '',
+            phase2.functionalSpec,
+          );
+          if (!reviewResult.tbCorrect) {
+            mod.debugHistory.push(`[VE fixed TB after audit] ${reviewResult.reason?.slice(0, 300) ?? ''}`);
+            yield { type: 'status', content: `VE fixed TB based on audit: ${reviewResult.fixedTBPath}` };
+          } else {
+            // VE disagrees with audit (says TB is correct) — no point re-auditing same TB
+            mod.debugHistory.push(`[Audit/VE disagree] Audit says checker wrong, VE says correct: ${reviewResult.reason?.slice(0, 200) ?? ''}`);
+            break;
           }
+
+          // Re-simulate after TB fix
+          if (!context.executeAction) break;
+          const reSimResult = await context.executeAction({
+            type: 'runSimulation',
+            payload: { module: mod.name, testType: 'ut', regression: true },
+          });
+          if (reSimResult.includes('TEST PASSED') || reSimResult.includes('PASSED')) {
+            mod.utPassed = true;
+            mod.status = 'done';
+            await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} RESOLVED by spec audit round=${auditRound + 1}`);
+            yield { type: 'status', content: `Debug resolved for ${mod.name} — TB checker was incorrect (fixed by spec audit)` };
+            return;
+          }
+          // TB fix didn't fully resolve — update error and loop to re-audit
+          currentError = reSimResult;
+          lastNormalizedError = this.normalizeError(reSimResult);
+          errorCounts.set(lastNormalizedError, 1);
+        } catch (err) {
+          await this.logWorkflow(context, 'SPEC_AUDIT', 'fail', `module=${mod.name} ${err instanceof Error ? err.message : ''}`);
+          break;
         }
-      } catch (err) {
-        // Audit failed — continue with normal debug loop
-        await this.logWorkflow(context, 'SPEC_AUDIT', 'fail', `module=${mod.name} ${err instanceof Error ? err.message : ''}`);
       }
     }
 
@@ -1282,17 +1339,62 @@ export class Orchestrator {
             mod.status = 'failed';
             return;
           }
-          // Infrastructure resolved it — reset compile counters and continue loop to re-sim
+          // Infrastructure resolved it — reset compile counters and error tracking
           compileSameErrorCount = 0;
           compileTotalCount = 0;
+          lastCompileError = '';
+          errorCounts.clear();
+          lastNormalizedError = '';
+          consecutiveSimilarCheckerRounds = 0;
         } else {
-          // Specific-role fix
-          mod.veCompileAttempts++;
-          await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=VE_compile attempt=${mod.veCompileAttempts} same=${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} total=${compileTotalCount}/${COMPILE_TOTAL_CAP}`);
-          yield { type: 'status', content: `Compile error detected, routing to VE for fix (${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} same, ${compileTotalCount}/${COMPILE_TOTAL_CAP} total)...` };
-          const fixed = await fixCompileErrors(ctx, mod.name, currentError);
-          if (!fixed) {
-            yield { type: 'status', content: `VE compile fix produced no output for ${mod.name}` };
+          // Tier 1: Specific-role fix — route by error source
+          const errorSource = this.classifyCompileError(currentError);
+
+          if (errorSource === 'unknown') {
+            // Can't determine source → skip Tier 1, go directly to infrastructure
+            await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=infra_debug_compile reason=unknown_source`);
+            yield { type: 'status', content: `Compile error source unclear — escalating to Infrastructure Debug Agent...` };
+
+            const infraGen = runInfraDebug(ctx, currentError, 'compile');
+            let infraResult;
+            while (true) {
+              const { value, done } = await infraGen.next();
+              if (done) {
+                infraResult = value;
+                break;
+              }
+              yield value;
+            }
+
+            if (!infraResult.resolved) {
+              yield { type: 'error', content: `Infrastructure Debug Agent could not resolve compile error for ${mod.name}. Manual intervention required.` };
+              mod.status = 'failed';
+              return;
+            }
+            compileSameErrorCount = 0;
+            compileTotalCount = 0;
+            lastCompileError = '';
+            errorCounts.clear();
+            lastNormalizedError = '';
+            consecutiveSimilarCheckerRounds = 0;
+          } else if (errorSource === 'rtl') {
+            // RTL compile error → Designer fixes (same as lint fix)
+            mod.lintAttempts++;
+            await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=Designer_compile same=${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} total=${compileTotalCount}/${COMPILE_TOTAL_CAP}`);
+            yield { type: 'status', content: `RTL compile error detected, routing to Designer for fix (${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} same, ${compileTotalCount}/${COMPILE_TOTAL_CAP} total)...` };
+            const fixed = await fixLintErrors(ctx, mod.name, currentError, context.hdlStandard);
+            if (!fixed) {
+              yield { type: 'status', content: `Designer compile fix produced no output for ${mod.name}` };
+            }
+          } else {
+            // TB/TC compile error → VE fixes
+            mod.veCompileAttempts++;
+            await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=VE_compile same=${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} total=${compileTotalCount}/${COMPILE_TOTAL_CAP}`);
+            yield { type: 'status', content: `TB/TC compile error detected, routing to VE for fix (${compileSameErrorCount}/${COMPILE_SAME_ERROR_CAP} same, ${compileTotalCount}/${COMPILE_TOTAL_CAP} total)...` };
+            const fixed = await fixCompileErrors(ctx, mod.name, currentError);
+            if (!fixed) {
+              yield { type: 'status', content: `VE compile fix produced no output for ${mod.name}` };
+            }
           }
         }
       } else {
@@ -1321,37 +1423,62 @@ export class Orchestrator {
         // ── tb_suspect path ──
         if (diagnosis.diagnosis === 'tb_suspect') {
           mod.tbSuspectCount++;
-          // v3: Record tb_suspect in debug history
-          mod.debugHistory.push(`[tb_suspect] ${diagnosis.reason ?? 'no reason'}`);
 
-          yield {
-            type: 'status',
-            content: `Designer suspects testbench issue: ${diagnosis.reason ?? 'no reason given'}`,
-          };
-
-          const reviewResult = await reviewTB(
-            ctx,
-            mod.name,
-            diagnosis.reason ?? '',
-            verifReqs ?? '',
-          );
-
-          if (reviewResult.tbCorrect) {
-            const veReason = reviewResult.reason ?? 'no reason given';
-            await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=tb_suspect result=TB_correct`);
-            yield { type: 'status', content: `VE confirms TB is correct: ${veReason.slice(0, 200)}` };
-            mod.debugHistory.push(`[VE confirms TB correct] ${veReason.slice(0, 300)}`);
+          // Cap: after N tb_suspect rounds, skip VE review and treat as RTL fix
+          if (mod.tbSuspectCount > TB_SUSPECT_CAP) {
+            yield { type: 'status', content: `tb_suspect capped (${mod.tbSuspectCount}/${TB_SUSPECT_CAP}) — TB has been independently reviewed, focusing on RTL.` };
+            mod.debugHistory.push(`[tb_suspect ignored — cap reached] ${diagnosis.reason ?? ''}`);
+            // Fall through to the fix path below (diagnosis.fixedCode will be falsy, so no-op — next iteration Designer should fix RTL)
           } else {
-            const fixReason = reviewResult.reason ?? '';
-            await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=tb_suspect result=TB_fixed`);
-            yield { type: 'status', content: `VE fixed testbench: ${reviewResult.fixedTBPath}${fixReason ? ' — ' + fixReason.slice(0, 150) : ''}` };
-            mod.debugHistory.push(`[VE fixed TB] ${fixReason.slice(0, 300)}`);
+            // v3: Record tb_suspect in debug history
+            mod.debugHistory.push(`[tb_suspect] ${diagnosis.reason ?? 'no reason'}`);
+
+            yield {
+              type: 'status',
+              content: `Designer suspects testbench issue: ${diagnosis.reason ?? 'no reason given'}`,
+            };
+
+            const reviewResult = await reviewTB(
+              ctx,
+              mod.name,
+              diagnosis.reason ?? '',
+              verifReqs ?? '',
+              phase2?.functionalSpec,
+            );
+
+            if (reviewResult.tbCorrect) {
+              const veReason = reviewResult.reason ?? 'no reason given';
+              await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=tb_suspect result=TB_correct`);
+              yield { type: 'status', content: `VE confirms TB is correct: ${veReason.slice(0, 200)}` };
+              mod.debugHistory.push(`[VE confirms TB correct] ${veReason.slice(0, 300)}`);
+            } else {
+              const fixReason = reviewResult.reason ?? '';
+              await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=tb_suspect result=TB_fixed`);
+              yield { type: 'status', content: `VE fixed testbench: ${reviewResult.fixedTBPath}${fixReason ? ' — ' + fixReason.slice(0, 150) : ''}` };
+              mod.debugHistory.push(`[VE fixed TB] ${fixReason.slice(0, 300)}`);
+            }
           }
         } else {
           // ── fix path ──
           if (diagnosis.fixedCode) {
             await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=designer result=fix target=${diagnosis.targetFile ?? mod.file}`);
             yield { type: 'progress', content: `Applied RTL fix to ${diagnosis.targetFile ?? mod.file}` };
+
+            // Re-lint after debug fix to catch syntax errors early
+            if (context.executeAction) {
+              try {
+                const lintResult = await context.executeAction({
+                  type: 'lintCode',
+                  payload: { file: mod.file },
+                });
+                const hasLintErr = /\berror\b/i.test(lintResult) &&
+                  !/\b0\s+error/i.test(lintResult) && !/no\s+error/i.test(lintResult);
+                if (hasLintErr) {
+                  yield { type: 'status', content: `Debug fix introduced lint error, fixing...` };
+                  await fixLintErrors(ctx, mod.name, lintResult, context.hdlStandard);
+                }
+              } catch { /* lint tool unavailable — skip */ }
+            }
           } else {
             await this.logWorkflow(context, 'DEBUG', 'done', `module=${mod.name} route=designer result=no_code`);
             yield { type: 'status', content: `Debug fix produced no code for ${mod.name}` };
@@ -1384,6 +1511,11 @@ export class Orchestrator {
           if (!passed) {
             // A different TC failed — switch to debugging that one
             result = regResult;
+            // Reset debug state for the new TC
+            vcdEnabled = false;
+            errorCounts.clear();
+            consecutiveSimilarCheckerRounds = 0;
+            mod.sameErrorRetries = 0;
             yield { type: 'status', content: `Regression found new failure: ${this.extractFailingTC(regResult) ?? 'unknown TC'}` };
           }
         }
@@ -1635,7 +1767,7 @@ export class Orchestrator {
     const contracts = this.phase1Output.interfaceContracts;
 
     await this.logWorkflow(context, 'VE_ST', 'start', `top=${topModule}`);
-    for await (const chunk of generateSTTestbench(ctx, stReqs, allPorts, topModule, contracts)) {
+    for await (const chunk of generateSTTestbench(ctx, stReqs, allPorts, topModule, contracts, this.phase1Output.globalParameters)) {
       yield chunk;
     }
 
@@ -1726,7 +1858,9 @@ export class Orchestrator {
         mod.sameErrorRetries = 0;
         mod.totalIterations = 0;
         mod.status = 'testing';
-        yield* this.debugLoop(mod, stOutput, context);
+        // Prepend triage diagnosis so Designer knows what to look for in this module
+        const stErrorWithDiagnosis = `[ST Triage] ${triage.diagnosis}\n\n${stOutput}`;
+        yield* this.debugLoop(mod, stErrorWithDiagnosis, context);
 
         if ((mod.status as string) !== 'done') {
           yield { type: 'status', content: `Debug loop for "${mod.name}" did not resolve. Manual intervention needed.` };
@@ -1951,17 +2085,17 @@ export class Orchestrator {
     const newStatuses: ModuleStatus[] = newP1.dependencyOrder
       .filter(name => !topSet.has(name) || !newP1.topPorts?.length)
       .map(name => {
+        const existing = oldStatuses.get(name);
         if (diff.unchanged.includes(name)) {
           // Keep existing status
-          const existing = oldStatuses.get(name);
           if (existing && (existing.status === 'done' || existing.status === 'skipped')) {
             return existing;
           }
         }
-        // Changed, added, or was pending — reset
+        // Changed, added, or was pending — reset (preserve file path from existing if available)
         return {
           name,
-          file: `hw/src/hdl/${name}.v`,
+          file: existing?.file ?? `hw/src/hdl/${name}.v`,
           lintPassed: false,
           utPassed: false,
           sameErrorRetries: 0,
@@ -2092,6 +2226,42 @@ export class Orchestrator {
   }
 
   /**
+   * Classify compile error source: RTL file, TB/TC file, or unknown.
+   * Extracts "file:line:" patterns from error output to determine which role should fix.
+   */
+  private classifyCompileError(simOutput: string): 'rtl' | 'tb' | 'unknown' {
+    // Extract file references from error lines (format: "path/file.ext:line:" or "In file path/file.ext")
+    // Only consider lines with actual error/warning indicators
+    const errorLineRe = /error|warning|syntax|undeclared|not found|unable/i;
+    // Match file paths ending in .v or .sv with a line number (typical EDA error format)
+    const fileRefRe = /([\w/._-]+\.s?v)\s*:\s*\d+/g;
+
+    const rtlFiles = new Set<string>();
+    const tbFiles = new Set<string>();
+
+    for (const line of simOutput.split('\n')) {
+      if (!errorLineRe.test(line)) continue;
+
+      let match: RegExpExecArray | null;
+      fileRefRe.lastIndex = 0;
+      while ((match = fileRefRe.exec(line)) !== null) {
+        const filePath = match[1];
+        // Classify by path: hw/src/ = RTL, hw/dv/ = TB/TC
+        if (/hw\/src\//.test(filePath)) {
+          rtlFiles.add(filePath);
+        } else if (/hw\/dv\//.test(filePath) || /\btb_/.test(filePath) || /\btc_/.test(filePath)) {
+          tbFiles.add(filePath);
+        }
+        // Files not matching either pattern are ignored (won't affect classification)
+      }
+    }
+
+    if (rtlFiles.size > 0 && tbFiles.size === 0) return 'rtl';
+    if (tbFiles.size > 0 && rtlFiles.size === 0) return 'tb';
+    return 'unknown';
+  }
+
+  /**
    * Convert VCD timescale string (e.g. "1ns", "10ps", "100us") to nanoseconds per unit.
    * Returns how many ns one VCD time unit represents.
    */
@@ -2114,11 +2284,11 @@ export class Orchestrator {
 
   private normalizeError(error: string): string {
     return error
-      .replace(/\d+:\d+/g, 'N:N')
-      .replace(/time\s+\d+/gi, 'time N')
+      .replace(/time\s+\d+/gi, 'time N')          // simulation timestamps
+      .replace(/#\s*\d+/g, '# N')                  // delay values
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 200);
+      .slice(0, 500);
   }
 
   private compressHistory(context: OrchestratorContext): void {
