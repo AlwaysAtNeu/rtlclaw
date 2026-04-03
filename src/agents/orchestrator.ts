@@ -997,7 +997,17 @@ export class Orchestrator {
     await this.logWorkflow(context, 'RTL_WRITE', 'done', `module=${mod.name} file=${mod.file}`);
   }
 
-  // ── Lint (4 → fresh rewrite → 4 → infrastructure → give up) ──
+  // ── Lint ──
+  //
+  // Routing priority:
+  // 1. Infrastructure error type (MODDUP, file not found, etc.) → infra immediately
+  // 2. Non-module-file error (design_params.vh, etc.) → infra immediately
+  // 3. Same error type persists 2 rounds → infra (Designer can't fix it)
+  // 4. Normal: Designer fix → re-lint
+  // 5. At attempt 4: fresh rewrite with lint error context
+  // 6. At attempt 8 or fixLintErrors returns false: → infra
+  //
+  // Max 2 infrastructure escalations to prevent infinite loops.
 
   private async *runLint(
     mod: ModuleStatus,
@@ -1013,9 +1023,12 @@ export class Orchestrator {
     yield { type: 'progress', content: `Linting ${mod.name}...` };
 
     const ctx = this.buildStageContext(context);
-    let lastLintResult = '';  // For fresh-rewrite context (#2b)
+    let lastLintResult = '';   // For fresh-rewrite context
+    let lastNormalizedLint = '';
+    let sameLintErrorCount = 0;
+    let infraEscalations = 0;  // Cap infrastructure attempts
 
-    while (mod.lintAttempts < LINT_ATTEMPT_CAP * 2) {
+    while (true) {
       let lintResult: string;
       try {
         lintResult = await context.executeAction({
@@ -1041,7 +1054,44 @@ export class Orchestrator {
       mod.lintAttempts++;
       lastLintResult = lintResult;
 
-      // After first 4 attempts, trigger fresh Designer rewrite with lint error context
+      // Track same-error for escalation (strip file:line for robust comparison)
+      const normalized = this.normalizeLintError(lintResult);
+      if (normalized === lastNormalizedLint) {
+        sameLintErrorCount++;
+      } else {
+        sameLintErrorCount = 1;
+        lastNormalizedLint = normalized;
+      }
+
+      // ── Check if error is an infrastructure issue ──
+      // Priority 1: Error TYPE is inherently non-code (MODDUP, file not found, etc.)
+      // Priority 2: Error doesn't reference current module file at all
+      const needsInfra =
+        this.isInfrastructureLintError(lintResult) ||
+        !this.isModuleLintError(lintResult, mod.name);
+
+      if (needsInfra) {
+        const reason = this.isInfrastructureLintError(lintResult)
+          ? 'structural/infrastructure error type'
+          : 'error from non-RTL source';
+        const resolved = yield* this.escalateLintToInfra(ctx, mod, lintResult, infraEscalations, reason);
+        infraEscalations++;
+        if (!resolved) { mod.lintPassed = false; return; }
+        continue;
+      }
+
+      // ── Same error type 2 consecutive rounds → infrastructure ──
+      if (sameLintErrorCount >= 2) {
+        const resolved = yield* this.escalateLintToInfra(ctx, mod, lintResult, infraEscalations,
+          `same error persisted ${sameLintErrorCount} rounds`);
+        infraEscalations++;
+        if (!resolved) { mod.lintPassed = false; return; }
+        sameLintErrorCount = 0;
+        lastNormalizedLint = '';
+        continue;
+      }
+
+      // ── Fresh rewrite at halfway (attempt 4) ──
       if (mod.lintAttempts === LINT_ATTEMPT_CAP) {
         yield { type: 'status', content: `Lint fix failed ${LINT_ATTEMPT_CAP} times for ${mod.name}, requesting fresh rewrite...` };
         const phase2 = this.phase2Outputs.get(mod.name);
@@ -1054,41 +1104,59 @@ export class Orchestrator {
         continue;
       }
 
-      // After 8 total attempts, escalate to infrastructure as last resort
+      // ── Total cap (attempt 8) → infrastructure ──
       if (mod.lintAttempts >= LINT_ATTEMPT_CAP * 2) {
-        await this.logWorkflow(context, 'LINT', 'start', `module=${mod.name} route=infra_debug_lint attempts=${mod.lintAttempts}`);
-        yield { type: 'status', content: `Lint fix exhausted after ${mod.lintAttempts} attempts — escalating to Infrastructure Debug Agent...` };
-
-        const infraGen = runInfraDebug(ctx, lintResult, 'compile');
-        let infraResult;
-        while (true) {
-          const { value, done } = await infraGen.next();
-          if (done) {
-            infraResult = value;
-            break;
-          }
-          yield value;
-        }
-
-        if (infraResult.resolved) {
-          // Infrastructure resolved — re-lint (don't reset lintAttempts to prevent infinite loop)
-          yield { type: 'status', content: `Infrastructure resolved lint issue. Re-linting ${mod.name}...` };
-          continue;
-        }
-        yield { type: 'error', content: `Lint fix exhausted for ${mod.name}. Manual intervention required.` };
-        mod.lintPassed = false;
-        return;
+        const resolved = yield* this.escalateLintToInfra(ctx, mod, lintResult, infraEscalations,
+          `${mod.lintAttempts} total attempts exhausted`);
+        infraEscalations++;
+        if (!resolved) { mod.lintPassed = false; return; }
+        continue;
       }
 
+      // ── Normal Designer fix ──
       await this.logWorkflow(context, 'LINT_FIX', 'start', `module=${mod.name} attempt=${mod.lintAttempts}`);
       yield { type: 'status', content: `Lint errors in ${mod.name} (attempt ${mod.lintAttempts}), fixing...` };
       const fixed = await fixLintErrors(ctx, mod.name, lintResult, context.hdlStandard);
       if (!fixed) {
-        yield { type: 'status', content: `Lint fix produced no output for ${mod.name}` };
-        mod.lintPassed = false;
-        return;
+        // Designer produced no code → escalate to infrastructure (not give up)
+        yield { type: 'status', content: `Designer produced no fix for ${mod.name} lint error, escalating...` };
+        const resolved = yield* this.escalateLintToInfra(ctx, mod, lintResult, infraEscalations,
+          'Designer produced no fix');
+        infraEscalations++;
+        if (!resolved) { mod.lintPassed = false; return; }
+        continue;
       }
     }
+  }
+
+  /**
+   * Escalate a lint error to infrastructure debug.
+   * Returns true if infrastructure resolved the issue (caller should re-lint).
+   * Returns false if failed/capped (caller should exit runLint).
+   */
+  private async *escalateLintToInfra(
+    ctx: StageContext,
+    mod: ModuleStatus,
+    lintResult: string,
+    infraEscalations: number,
+    reason: string,
+  ): AsyncGenerator<OutputChunk, boolean> {
+    if (infraEscalations >= 2) {
+      yield { type: 'error', content: `Lint error for ${mod.name} persists after ${infraEscalations} infrastructure attempts (${reason}). Manual intervention required.` };
+      mod.lintPassed = false;
+      return false;
+    }
+
+    yield { type: 'status', content: `Lint error in ${mod.name}: ${reason} — routing to Infrastructure Debug Agent...` };
+
+    const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, lintResult, 'compile'));
+    if (infraResult.resolved) {
+      yield { type: 'status', content: `Infrastructure resolved lint issue for ${mod.name}. Re-linting...` };
+      return true;
+    }
+    yield { type: 'error', content: `Infrastructure could not resolve lint error for ${mod.name}. Manual intervention required.` };
+    mod.lintPassed = false;
+    return false;
   }
 
   // ── UT with debug loop ──
@@ -1323,16 +1391,7 @@ export class Orchestrator {
           await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=infra_debug_compile same=${compileSameErrorCount} total=${compileTotalCount}`);
           yield { type: 'status', content: `Compile fix exhausted (same-error: ${compileSameErrorCount}, total: ${compileTotalCount}) — escalating to Infrastructure Debug Agent...` };
 
-          const infraGen = runInfraDebug(ctx, currentError, 'compile');
-          let infraResult;
-          while (true) {
-            const { value, done } = await infraGen.next();
-            if (done) {
-              infraResult = value;
-              break;
-            }
-            yield value;
-          }
+          const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, currentError, 'compile'));
 
           if (!infraResult.resolved) {
             yield { type: 'error', content: `Infrastructure Debug Agent could not resolve compile error for ${mod.name}. Manual intervention required.` };
@@ -1355,16 +1414,7 @@ export class Orchestrator {
             await this.logWorkflow(context, 'DEBUG', 'start', `module=${mod.name} route=infra_debug_compile reason=unknown_source`);
             yield { type: 'status', content: `Compile error source unclear — escalating to Infrastructure Debug Agent...` };
 
-            const infraGen = runInfraDebug(ctx, currentError, 'compile');
-            let infraResult;
-            while (true) {
-              const { value, done } = await infraGen.next();
-              if (done) {
-                infraResult = value;
-                break;
-              }
-              yield value;
-            }
+            const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, currentError, 'compile'));
 
             if (!infraResult.resolved) {
               yield { type: 'error', content: `Infrastructure Debug Agent could not resolve compile error for ${mod.name}. Manual intervention required.` };
@@ -1688,16 +1738,7 @@ export class Orchestrator {
           ? `Module: ${mod.name}\nLast error:\n${mod.debugHistory[mod.debugHistory.length - 1]}`
           : `Module: ${mod.name}\nDebug exhausted after ${mod.totalIterations} iterations.`;
 
-        const infraGen = runInfraDebug(ctx, lastError, 'functional', specStr);
-        let infraResult;
-        while (true) {
-          const { value, done } = await infraGen.next();
-          if (done) {
-            infraResult = value;
-            break;
-          }
-          yield value;
-        }
+        const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, lastError, 'functional', specStr));
 
         await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} rounds=${infraResult.toolRounds}`);
 
@@ -2223,6 +2264,76 @@ export class Orchestrator {
       lower.includes('$finish') ||
       lower.includes('vcd info');           // VCD dump started = sim ran
     return hasCompileIndicators && !hasRuntimeOutput;
+  }
+
+  /**
+   * Drain an infrastructure debug async generator, yielding all progress
+   * chunks and returning the final InfraDebugResult.
+   */
+  private async *drainInfraDebug(
+    gen: AsyncGenerator<OutputChunk, import('../stages/infra-debug.js').InfraDebugResult>,
+  ): AsyncGenerator<OutputChunk, import('../stages/infra-debug.js').InfraDebugResult> {
+    while (true) {
+      const { value, done } = await gen.next();
+      if (done) return value;
+      yield value;
+    }
+  }
+
+  /**
+   * Detect lint errors that are inherently infrastructure issues regardless
+   * of which file they reference. These can never be fixed by editing RTL code.
+   *
+   * Examples: MODDUP (duplicate module — filelist includes same file twice),
+   * file not found, missing include path, etc.
+   */
+  private isInfrastructureLintError(lintOutput: string): boolean {
+    const lower = lintOutput.toLowerCase();
+    const infraPatterns = [
+      'moddup',                      // verilator: duplicate module definition
+      'already defined',             // iverilog: module already defined
+      'duplicate definition',        // generic: duplicate module
+      'was already defined',         // iverilog variant
+      'file not found',              // missing file
+      'no such file',                // missing file (unix-style)
+      'cannot open',                 // file access issue
+      'cannot find.*include',        // missing include
+      'include file.*not found',     // iverilog include error
+      'no top level modules',        // no modules in filelist
+      'unable to open',              // file access
+    ];
+    return infraPatterns.some(p => new RegExp(p, 'i').test(lower));
+  }
+
+  /**
+   * Check if a lint error references the current module's file.
+   * Returns true if at least one error line mentions the module filename.
+   * If false, the error is from non-RTL sources (design_params, filelist, deps).
+   */
+  private isModuleLintError(lintOutput: string, moduleName: string): boolean {
+    const errorLineRe = /error|warning|syntax|undeclared|not found|unable/i;
+    const moduleFileRe = new RegExp(`\\b${moduleName}\\.s?v\\b`);
+
+    for (const line of lintOutput.split('\n')) {
+      if (!errorLineRe.test(line)) continue;
+      if (moduleFileRe.test(line)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Normalize lint error for same-error comparison.
+   * Strips file paths, line/column numbers so that the same error type
+   * (e.g. MODDUP) is recognized as identical even when line numbers change
+   * after a Designer "fix" attempt.
+   */
+  private normalizeLintError(error: string): string {
+    return error
+      .replace(/[\w/.~-]+\.s?vh?\s*:\s*\d+(?:\s*:\s*\d+)?/g, 'FILE:N') // file.v:15:3 → FILE:N
+      .replace(/line\s+\d+/gi, 'line N')                                 // "line 15" → "line N"
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
   }
 
   /**

@@ -1,16 +1,24 @@
 /**
  * Fallback LLM backend wrapper.
  *
- * Tries the primary backend first. On ANY failure, switches to the fallback.
- * If fallback also fails, throws the fallback error.
+ * Tries the primary backend first. On ANY failure (including hang/timeout),
+ * switches to the fallback. If fallback also fails, throws the fallback error.
  *
  * "Sticky" switching: once the primary fails, all subsequent calls go directly
  * to the fallback without retrying the primary. This avoids noisy repeated
  * errors (e.g. Gemini 400 on every tool-calling round).
+ *
+ * Wall-clock timeout: complete() races the primary call against a deadline.
+ * If the primary hangs (server accepts connection but never responds),
+ * the timeout fires and triggers fallback. Without this, a hanging primary
+ * blocks forever because no error is thrown for the catch block to handle.
  */
 
 import { LLMBackend } from './base.js';
 import type { LLMResponse, Message, StreamChunk, LLMCompleteOptions } from './types.js';
+
+/** Wall-clock timeout for primary backend complete() calls (ms). */
+const PRIMARY_TIMEOUT_MS = 300_000; // 5 minutes
 
 export class FallbackBackend extends LLMBackend {
   private primary: LLMBackend;
@@ -46,8 +54,34 @@ export class FallbackBackend extends LLMBackend {
     if (this.useFallback) {
       return this.fallback.complete(messages, options);
     }
+
+    // Race primary against a wall-clock timeout.
+    // This catches the case where the primary hangs indefinitely
+    // (server alive but never sends response data) — no error is thrown,
+    // so the catch block alone is insufficient.
+    //
+    // We use Promise.race instead of AbortController because not all
+    // backends propagate the signal (e.g. Anthropic SDK doesn't use it).
+    // The abandoned primary promise will eventually resolve/reject on its own;
+    // its result is simply discarded.
+    const timeoutMs = options?.timeoutMs ?? PRIMARY_TIMEOUT_MS;
+
     try {
-      return await this.primary.complete(messages, options);
+      let timer: ReturnType<typeof setTimeout>;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Primary backend timed out after ${timeoutMs / 1000}s`)),
+          timeoutMs,
+        );
+        if (timer.unref) timer.unref();
+      });
+
+      const result = await Promise.race([
+        this.primary.complete(messages, options),
+        timeoutPromise,
+      ]);
+      clearTimeout(timer!);
+      return result;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       this.switchToFallback(errMsg);
