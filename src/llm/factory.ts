@@ -130,6 +130,13 @@ export async function createBackendWithFallback(
   const primary = await createBackend(primaryConfig);
   if (!fallbackConfig) return primary;
 
-  const fallback = await createBackend(fallbackConfig);
-  return new FallbackBackend(primary, fallback, onSwitch);
+  try {
+    const fallback = await createBackend(fallbackConfig);
+    return new FallbackBackend(primary, fallback, onSwitch);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`  [Warning] Fallback LLM (${fallbackConfig.provider}) init failed: ${msg}\n`);
+    process.stderr.write(`  Continuing with primary provider only.\n`);
+    return primary;
+  }
 }

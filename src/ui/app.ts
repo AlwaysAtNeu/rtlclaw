@@ -240,10 +240,13 @@ function printHelp(): void {
     cmd('/project list', 'List known projects'),
     cmd('/project close', 'Return to Claw Mode'),
     '',
-    chalk.bold.hex('#9944FF')('  \u25B8 Model'),
+    chalk.bold.hex('#9944FF')('  \u25B8 Model & Config'),
     cmd('/model', 'Show or switch model'),
     cmd('/provider <name>', 'Switch LLM provider'),
-    cmd('/config', 'Show current config'),
+    cmd('/config show', 'Show full configuration'),
+    cmd('/config set <key> <val>', 'Set config value'),
+    cmd('/config reset', 'Reset to defaults'),
+    cmd('/config ...', 'apikey|fallback|simulator|hdl|device|timeout|debug|path'),
     '',
     chalk.bold.hex('#FF22DD')('  \u25B8 Workflow'),
     cmd('/continue', 'Resume paused workflow'),
@@ -267,6 +270,8 @@ class Spinner {
   private frames = ['\u280B', '\u2819', '\u2839', '\u2838', '\u283C', '\u2834', '\u2826', '\u2827', '\u2807', '\u280F'];
   private idx = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+
+  get isRunning(): boolean { return this.timer !== null; }
 
   start(label: string): void {
     this.stop();
@@ -829,7 +834,22 @@ const COMMANDS: CommandDef[] = [
   },
   { name: '/model', args: '[name]', description: 'Show or switch model' },
   { name: '/provider', args: '<name>', description: 'Switch LLM provider' },
-  { name: '/config', description: 'Show current config' },
+  {
+    name: '/config', args: '<action>', description: 'Manage configuration',
+    subcommands: [
+      { name: '/config show', description: 'Show full config' },
+      { name: '/config set', args: '<key> <value>', description: 'Set config value' },
+      { name: '/config reset', description: 'Reset to defaults' },
+      { name: '/config apikey', args: '[key]', description: 'Set or view API key' },
+      { name: '/config fallback', args: '[provider/model]', description: 'Set/clear fallback LLM' },
+      { name: '/config simulator', args: '<name>', description: 'Set default simulator' },
+      { name: '/config hdl', args: '<standard>', description: 'Set HDL standard' },
+      { name: '/config device', args: '<name>', description: 'Set target device' },
+      { name: '/config timeout', args: '<ms>', description: 'Set LLM timeout' },
+      { name: '/config debug', description: 'Show/set debug params' },
+      { name: '/config path', description: 'Show config file path' },
+    ],
+  },
   { name: '/continue', description: 'Resume paused workflow' },
   { name: '/auto', description: 'Toggle auto mode' },
   { name: '/tools', description: 'Show EDA tool status' },
@@ -885,9 +905,34 @@ class CommandSuggestions {
   private matches: FlatCommand[] = [];
   private active = process.stdout.isTTY === true;
   private rl: readline.Interface;
+  /** Cached projects for /project open completion, local-first */
+  private cachedProjects: Array<{ name: string; rootPath: string; local: boolean }> = [];
+  private projectNamesLoaded = false;
 
   constructor(rl: readline.Interface) {
     this.rl = rl;
+  }
+
+  /** Reload cached project list, marking local (under cwd) projects */
+  async reloadProjects(): Promise<void> {
+    try {
+      const { ProjectManager } = await import('../project/manager.js');
+      const pm = new ProjectManager();
+      const projects = await pm.listProjects();
+      const cwd = process.cwd() + path.sep;
+      this.cachedProjects = projects.map(p => ({
+        ...p,
+        local: p.rootPath === process.cwd() || p.rootPath.startsWith(cwd),
+      }));
+      // Local projects first
+      this.cachedProjects.sort((a, b) => (a.local === b.local ? 0 : a.local ? -1 : 1));
+      this.projectNamesLoaded = true;
+    } catch { this.cachedProjects = []; }
+  }
+
+  /** Get sorted project list (local first) */
+  getProjects(): Array<{ name: string; rootPath: string; local: boolean }> {
+    return this.cachedProjects;
   }
 
   refresh(line: string): void {
@@ -896,6 +941,34 @@ class CommandSuggestions {
 
     if (!trimmed.startsWith('/') || trimmed.length < 1) {
       this.hide();
+      return;
+    }
+
+    // Check for "/project open <partial>" — show project name completions
+    const projectOpenMatch = trimmed.match(/^\/project\s+open\s+(.*)$/i);
+    if (projectOpenMatch) {
+      if (!this.projectNamesLoaded) {
+        // Trigger async load; will show on next keystroke
+        void this.reloadProjects().then(() => {
+          const currentLine = ((this.rl as any).line as string ?? '').trimStart();
+          if (currentLine.match(/^\/project\s+open\s+/i)) this.refresh(currentLine);
+        });
+        return;
+      }
+      const partial = projectOpenMatch[1]!.toLowerCase();
+      const nameMatches = this.cachedProjects
+        .filter(p => p.name.toLowerCase().startsWith(partial))
+        .map(p => ({
+          name: `/project open ${p.name}`,
+          description: p.local ? 'Local' : p.rootPath,
+        }));
+      if (nameMatches.length === 0 || (nameMatches.length === 1 && nameMatches[0]!.name === trimmed)) {
+        this.hide();
+        return;
+      }
+      this.matches = nameMatches;
+      if (this.selectedIdx >= this.matches.length) this.selectedIdx = 0;
+      this.render();
       return;
     }
 
@@ -947,33 +1020,44 @@ class CommandSuggestions {
   private render(): void {
     this.clearLines();
 
-    const items = this.matches.slice(0, 8);
+    const maxVisible = 8;
+    const total = this.matches.length;
+    // Compute scroll window so selectedIdx is always visible
+    let scrollTop = 0;
+    if (this.selectedIdx >= maxVisible) {
+      scrollTop = this.selectedIdx - maxVisible + 1;
+    }
+    const visibleCount = Math.min(maxVisible, total - scrollTop);
     const out = process.stdout;
-    const n = items.length;
 
     // Pre-scroll: write N newlines to ensure terminal has room below.
     // Then move back up. This handles the case where the prompt is near
     // the bottom of the screen — the terminal scrolls to make space.
-    for (let i = 0; i < n; i++) out.write('\n');
-    out.write(`\x1b[${n}A`);
+    for (let i = 0; i < visibleCount; i++) out.write('\n');
+    out.write(`\x1b[${visibleCount}A`);
 
     // Render each suggestion line below the prompt
-    for (let i = 0; i < items.length; i++) {
-      const m = items[i]!;
-      const sel = i === this.selectedIdx;
+    for (let row = 0; row < visibleCount; row++) {
+      const idx = scrollTop + row;
+      const m = this.matches[idx]!;
+      const sel = idx === this.selectedIdx;
       const prefix = sel ? chalk.cyan(' \u25B8 ') : '   ';
       const name = sel ? chalk.cyan.bold(m.name) : chalk.cyan(m.name);
       const args = m.args ? chalk.dim(` ${m.args}`) : '';
       const desc = chalk.dim(` \u2014 ${m.description}`);
+      // Scroll indicators
+      let indicator = '';
+      if (row === 0 && scrollTop > 0) indicator = chalk.dim(' ↑');
+      if (row === visibleCount - 1 && scrollTop + visibleCount < total) indicator = chalk.dim(' ↓');
       out.write('\x1b[1B');                 // cursor down 1
       out.write('\r\x1b[2K');               // col 0 + clear entire line
-      out.write(`${prefix}${name}${args}${desc}`);
+      out.write(`${prefix}${name}${args}${desc}${indicator}`);
     }
 
-    this.renderedCount = items.length;
+    this.renderedCount = visibleCount;
 
     // Return to prompt line and position cursor correctly
-    out.write(`\x1b[${n}A`);               // move up N lines
+    out.write(`\x1b[${visibleCount}A`);    // move up N lines
     this.positionCursor();
   }
 
@@ -1001,6 +1085,108 @@ class CommandSuggestions {
 }
 
 // --------------------------------------------------------------------------
+// Interactive arrow-key selector
+// --------------------------------------------------------------------------
+
+/**
+ * Show a list of options and let the user pick one using Up/Down + Enter.
+ * Returns the selected item string, or null if cancelled (Esc / Ctrl+C).
+ */
+function interactiveSelect(
+  rl: readline.Interface,
+  title: string,
+  items: string[],
+  opts?: { highlight?: number },
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (items.length === 0) { resolve(null); return; }
+
+    let selected = opts?.highlight ?? 0;
+    const maxShow = Math.min(items.length, 12);
+    let scrollTop = 0; // first visible index
+    const out = process.stdout;
+
+    // Keep selected within the visible viewport
+    const adjustScroll = () => {
+      if (selected < scrollTop) scrollTop = selected;
+      if (selected >= scrollTop + maxShow) scrollTop = selected - maxShow + 1;
+    };
+    adjustScroll(); // initial
+
+    const render = () => {
+      // Move up to first item line (cursor is on last item line after render)
+      if (rendered && maxShow > 1) {
+        out.write(`\x1b[${maxShow - 1}A`);
+      }
+      for (let row = 0; row < maxShow; row++) {
+        const idx = scrollTop + row;
+        out.write('\r\x1b[2K');
+        if (idx < items.length) {
+          const sel = idx === selected;
+          const prefix = sel ? chalk.cyan(' \u25B8 ') : '   ';
+          const text = sel ? chalk.cyan.bold(items[idx]!) : items[idx]!;
+          // Show scroll indicators
+          let indicator = '';
+          if (row === 0 && scrollTop > 0) indicator = chalk.dim(' ↑');
+          if (row === maxShow - 1 && scrollTop + maxShow < items.length) indicator = chalk.dim(' ↓');
+          out.write(`  ${prefix}${text}${indicator}`);
+        }
+        if (row < maxShow - 1) out.write('\n');
+      }
+      out.write('\r');
+      rendered = true;
+    };
+
+    let rendered = false;
+
+    // Print title
+    console.log(chalk.bold(`\n  ${title}`));
+
+    // Pre-scroll
+    for (let i = 0; i < maxShow; i++) out.write('\n');
+    out.write(`\x1b[${maxShow}A`);
+
+    render();
+
+    // Temporarily replace _ttyWrite to capture keys
+    const origWrite = (rl as any)._ttyWrite;
+    (rl as any)._ttyWrite = function (s: string, key: { name?: string; ctrl?: boolean }) {
+      if (key?.name === 'up') {
+        selected = selected <= 0 ? items.length - 1 : selected - 1;
+        adjustScroll();
+        render();
+        return;
+      }
+      if (key?.name === 'down') {
+        selected = selected >= items.length - 1 ? 0 : selected + 1;
+        adjustScroll();
+        render();
+        return;
+      }
+      if (key?.name === 'return') {
+        cleanup();
+        resolve(items[selected]!);
+        return;
+      }
+      if (key?.name === 'escape' || (key?.ctrl && key?.name === 'c')) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+    };
+
+    const cleanup = () => {
+      (rl as any)._ttyWrite = origWrite;
+      // Move cursor below the rendered list
+      if (rendered) {
+        out.write(`\x1b[${maxShow - 1}B`);
+        out.write('\n');
+      }
+    };
+  });
+}
+
+// --------------------------------------------------------------------------
 // Command handler
 // --------------------------------------------------------------------------
 
@@ -1016,6 +1202,7 @@ async function handleCommand(
   config: ConfigManager,
   currentProjectPath: string | undefined,
   askUser?: (question: string) => Promise<string>,
+  rlRef?: readline.Interface,
 ): Promise<CommandResult> {
   const parts = input.trim().split(/\s+/);
   const cmd = parts[0]!.toLowerCase();
@@ -1047,43 +1234,37 @@ async function handleCommand(
       const { PROVIDER_MODELS } = await import('../llm/factory.js');
       const models = PROVIDER_MODELS[config.llm.provider] ?? [];
       const current = config.llm.model;
-      if (models.length === 0 || !askUser) {
+      if (models.length === 0 || !rlRef) {
         printSystem(`Provider: ${chalk.cyan(config.llm.provider)}  Model: ${chalk.cyan.bold(current)}`);
         return {};
       }
-      console.log(chalk.bold(`\n  ${config.llm.provider} models:`));
-      models.forEach((m, i) => {
-        const marker = m === current ? chalk.green(' \u25CF') : chalk.dim(' \u25CB');
-        console.log(`  ${chalk.cyan(`${i + 1})`)}${marker} ${m === current ? chalk.bold(m) : m}`);
-      });
-      console.log(`  ${chalk.cyan(`${models.length + 1})`)} ${chalk.dim('Custom model name')}`);
-      console.log(`  ${chalk.cyan(`0)`)} ${chalk.dim('Cancel')}`);
-      console.log();
-      const answer = await askUser('Select model:');
-      const idx = parseInt(answer.trim());
-      if (idx === 0 || isNaN(idx)) {
+      const options = [...models, '[ Custom model name ]'];
+      const currentIdx = models.indexOf(current);
+      const selected = await interactiveSelect(
+        rlRef,
+        `${config.llm.provider} models:`,
+        options,
+        { highlight: currentIdx >= 0 ? currentIdx : 0 },
+      );
+      if (!selected) {
         printSystem('Cancelled.');
         return {};
       }
-      if (idx >= 1 && idx <= models.length) {
-        const selected = models[idx - 1]!;
-        if (selected === current) {
-          printSystem(`Already using ${chalk.cyan(selected)}.`);
-          return {};
-        }
-        config.setLLM({ model: selected });
-        printSystem(`Model switched to: ${chalk.cyan.bold(selected)}`);
-        return { recreateBackend: true };
-      }
-      if (idx === models.length + 1) {
+      if (selected === '[ Custom model name ]') {
+        if (!askUser) return {};
         const customName = await askUser('Enter model name:');
         if (!customName.trim()) { printSystem('Cancelled.'); return {}; }
         config.setLLM({ model: customName.trim() });
         printSystem(`Model switched to: ${chalk.cyan.bold(customName.trim())}`);
         return { recreateBackend: true };
       }
-      printSystem('Invalid selection.');
-      return {};
+      if (selected === current) {
+        printSystem(`Already using ${chalk.cyan(selected)}.`);
+        return {};
+      }
+      config.setLLM({ model: selected });
+      printSystem(`Model switched to: ${chalk.cyan.bold(selected)}`);
+      return { recreateBackend: true };
     }
     case '/provider':
       if (parts[1]) {
@@ -1094,8 +1275,7 @@ async function handleCommand(
       printSystem(`Current provider: ${config.llm.provider}`);
       return {};
     case '/config':
-      printSystem(`Provider: ${config.llm.provider}  Model: ${config.llm.model}  Auto: ${config.config.autoMode}`);
-      return {};
+      return handleConfigCommand(parts, config, askUser, rlRef);
     case '/tools': {
       const { ToolRegistry } = await import('../tools/registry.js');
       const registry = new ToolRegistry();
@@ -1136,16 +1316,489 @@ async function handleCommand(
       return {};
     }
     case '/project':
-      return handleProjectCommand(parts);
+      return handleProjectCommand(parts, rlRef);
     default:
       printSystem(`Unknown command: ${cmd}. Type /help for help.`);
       return {};
   }
 }
 
-async function handleProjectCommand(parts: string[]): Promise<CommandResult> {
+async function handleConfigEdit(
+  action: string,
+  config: ConfigManager,
+  askUser?: (question: string) => Promise<string>,
+  rlRef?: readline.Interface,
+  HDL_STANDARDS: readonly string[] = ['verilog2001', 'verilog2005', 'sv2012', 'sv2017', 'vhdl2008'],
+): Promise<CommandResult> {
+  const c = config.config;
+  const PROVIDERS = ['openai', 'anthropic', 'gemini', 'deepseek', 'kimi', 'qwen', 'zhipu', 'ollama', 'openai-compatible'];
+
+  switch (action) {
+    case 'provider': {
+      if (!rlRef) return {};
+      const selected = await interactiveSelect(rlRef, 'Select provider:', PROVIDERS,
+        { highlight: Math.max(0, PROVIDERS.indexOf(c.llm.provider)) });
+      if (!selected) { printSystem('Cancelled.'); return {}; }
+      config.setLLM({ provider: selected as import('../config/schema.js').LLMProvider });
+      printSystem(`Provider: ${chalk.cyan(selected)}`);
+      return { recreateBackend: true };
+    }
+    case 'model':
+      return handleCommand('/model', config, undefined, askUser, rlRef);
+    case 'apikey':
+      return handleConfigCommand(['/config', 'apikey'], config, askUser, rlRef);
+    case 'temperature': {
+      if (!askUser) return {};
+      const val = await askUser(`Temperature [${c.llm.temperature}]:`);
+      if (val.trim()) {
+        const n = parseFloat(val.trim());
+        if (!isNaN(n) && n >= 0 && n <= 2) {
+          config.setLLM({ temperature: n });
+          printSystem(`temperature = ${chalk.cyan(String(n))}`);
+        } else {
+          printSystem('Invalid value (0-2).');
+        }
+      }
+      return {};
+    }
+    case 'timeout':
+      return handleConfigCommand(['/config', 'timeout'], config, askUser, rlRef);
+    case 'fallback':
+      return handleConfigCommand(['/config', 'fallback'], config, askUser, rlRef);
+    case 'simulator':
+      return handleConfigCommand(['/config', 'simulator'], config, askUser, rlRef);
+    case 'hdl':
+      return handleConfigCommand(['/config', 'hdl'], config, askUser, rlRef);
+    case 'device':
+      return handleConfigCommand(['/config', 'device'], config, askUser, rlRef);
+    case 'autoMode': {
+      const newVal = !c.autoMode;
+      config.set('autoMode', newVal);
+      printSystem(`autoMode = ${chalk.cyan(String(newVal))}`);
+      return {};
+    }
+    case 'logLevel': {
+      if (!rlRef) return {};
+      const levels = ['debug', 'info', 'warn', 'error'];
+      const selected = await interactiveSelect(rlRef, 'Select log level:', levels,
+        { highlight: Math.max(0, levels.indexOf(c.logLevel)) });
+      if (!selected) { printSystem('Cancelled.'); return {}; }
+      config.set('logLevel', selected as 'debug' | 'info' | 'warn' | 'error');
+      printSystem(`logLevel = ${chalk.cyan(selected)}`);
+      return {};
+    }
+    case 'debug':
+      return handleConfigCommand(['/config', 'debug'], config, askUser, rlRef);
+    case 'reset':
+      config.reset();
+      printSystem(chalk.yellow('Config reset to defaults.'));
+      return { recreateBackend: true };
+    default:
+      return {};
+  }
+}
+
+async function handleConfigCommand(
+  parts: string[],
+  config: ConfigManager,
+  askUser?: (question: string) => Promise<string>,
+  rlRef?: readline.Interface,
+): Promise<CommandResult> {
   const action = parts[1];
-  const arg = parts.slice(2).join(' ');
+  const arg = parts.slice(2).join(' ').trim();
+  const c = config.config;
+
+  const HDL_STANDARDS = ['verilog2001', 'verilog2005', 'sv2012', 'sv2017', 'vhdl2008'] as const;
+
+  switch (action) {
+    case 'show':
+    case undefined: {
+      // Full config display
+      const mask = (s?: string) => s ? s.slice(0, 4) + '****' + s.slice(-4) : chalk.dim('(not set)');
+      const kv = (key: string, val: string) =>
+        `  ${chalk.cyan(key.padEnd(24))}${val}`;
+      console.log([
+        '',
+        chalk.bold.hex('#00BBFF')('  LLM'),
+        kv('provider', c.llm.provider),
+        kv('model', c.llm.model),
+        kv('apiKey', mask(c.llm.apiKey)),
+        kv('baseUrl', c.llm.baseUrl ?? chalk.dim('(default)')),
+        kv('temperature', String(c.llm.temperature)),
+        kv('timeoutMs', String(c.llm.timeoutMs)),
+        '',
+        chalk.bold.hex('#00BBFF')('  Fallback LLM'),
+        c.fallbackLlm
+          ? [kv('provider', c.fallbackLlm.provider), kv('model', c.fallbackLlm.model)].join('\n')
+          : chalk.dim('  (not configured)'),
+        '',
+        chalk.bold.hex('#9944FF')('  Project Defaults'),
+        kv('simulator', c.project.defaultSimulator),
+        kv('synthesizer', c.project.defaultSynthesizer),
+        kv('hdlStandard', c.project.hdlStandard),
+        kv('targetDevice', c.project.targetDevice ?? chalk.dim('(not set)')),
+        '',
+        chalk.bold.hex('#FF22DD')('  Debug'),
+        kv('sameErrorMaxRetries', String(c.debug.sameErrorMaxRetries)),
+        kv('totalIterationCap', String(c.debug.totalIterationCap)),
+        kv('vcdTimeMarginNs', String(c.debug.vcdTimeMarginNs)),
+        kv('maxSignalsPerQuery', String(c.debug.maxSignalsPerQuery)),
+        '',
+        chalk.bold.white('  General'),
+        kv('autoMode', String(c.autoMode)),
+        kv('logLevel', c.logLevel),
+        kv('storageDir', c.storageDir),
+        '',
+      ].join('\n'));
+
+      // Interactive config menu
+      if (!rlRef) return {};
+      const menuItems = [
+        { label: `provider          ${chalk.dim(c.llm.provider)}`, action: 'provider' },
+        { label: `model             ${chalk.dim(c.llm.model)}`, action: 'model' },
+        { label: `apiKey            ${chalk.dim(mask(c.llm.apiKey))}`, action: 'apikey' },
+        { label: `temperature       ${chalk.dim(String(c.llm.temperature))}`, action: 'temperature' },
+        { label: `timeoutMs         ${chalk.dim(String(c.llm.timeoutMs))}`, action: 'timeout' },
+        { label: `fallback          ${chalk.dim(c.fallbackLlm ? `${c.fallbackLlm.provider}/${c.fallbackLlm.model}` : '(not set)')}`, action: 'fallback' },
+        { label: `simulator         ${chalk.dim(c.project.defaultSimulator)}`, action: 'simulator' },
+        { label: `hdlStandard       ${chalk.dim(c.project.hdlStandard)}`, action: 'hdl' },
+        { label: `targetDevice      ${chalk.dim(c.project.targetDevice ?? '(not set)')}`, action: 'device' },
+        { label: `autoMode          ${chalk.dim(String(c.autoMode))}`, action: 'autoMode' },
+        { label: `logLevel          ${chalk.dim(c.logLevel)}`, action: 'logLevel' },
+        { label: `debug params`, action: 'debug' },
+        { label: chalk.dim('Reset to defaults'), action: 'reset' },
+        { label: chalk.dim('Done'), action: 'done' },
+      ];
+      const selected = await interactiveSelect(
+        rlRef, 'Edit config:', menuItems.map(m => m.label),
+      );
+      if (!selected) return {};
+      const item = menuItems.find(m => m.label === selected);
+      if (!item || item.action === 'done') return {};
+
+      // Dispatch to the appropriate config action
+      return handleConfigEdit(item.action, config, askUser, rlRef, HDL_STANDARDS);
+    }
+
+    case 'set': {
+      // /config set <key> <value>
+      const setKey = parts[2];
+      const setVal = parts.slice(3).join(' ').trim();
+      if (!setKey || !setVal) {
+        printSystem('Usage: /config set <key> <value>');
+        printSystem(chalk.dim('Keys: temperature, timeoutMs, autoMode, logLevel, simulator, hdl, device, maxRetries, iterationCap'));
+        return {};
+      }
+      switch (setKey) {
+        case 'temperature':
+          config.setLLM({ temperature: parseFloat(setVal) });
+          printSystem(`temperature = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'timeoutMs':
+        case 'timeout':
+          config.setLLM({ timeoutMs: parseInt(setVal) });
+          printSystem(`timeoutMs = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'autoMode':
+          config.set('autoMode', setVal === 'true' || setVal === '1');
+          printSystem(`autoMode = ${chalk.cyan(String(setVal === 'true' || setVal === '1'))}`);
+          return {};
+        case 'logLevel':
+          config.set('logLevel', setVal as 'debug' | 'info' | 'warn' | 'error');
+          printSystem(`logLevel = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'simulator':
+          config.set('project', { ...c.project, defaultSimulator: setVal });
+          printSystem(`simulator = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'synthesizer':
+          config.set('project', { ...c.project, defaultSynthesizer: setVal });
+          printSystem(`synthesizer = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'hdl':
+        case 'hdlStandard':
+          if (!HDL_STANDARDS.includes(setVal as any)) {
+            printSystem(`Invalid HDL standard. Options: ${HDL_STANDARDS.join(', ')}`);
+            return {};
+          }
+          config.set('project', { ...c.project, hdlStandard: setVal as typeof HDL_STANDARDS[number] });
+          printSystem(`hdlStandard = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'device':
+        case 'targetDevice':
+          config.set('project', { ...c.project, targetDevice: setVal || undefined });
+          printSystem(`targetDevice = ${chalk.cyan(setVal || '(cleared)')}`);
+          return {};
+        case 'maxRetries':
+        case 'sameErrorMaxRetries':
+          config.set('debug', { ...c.debug, sameErrorMaxRetries: parseInt(setVal) });
+          printSystem(`sameErrorMaxRetries = ${chalk.cyan(setVal)}`);
+          return {};
+        case 'iterationCap':
+        case 'totalIterationCap':
+          config.set('debug', { ...c.debug, totalIterationCap: parseInt(setVal) });
+          printSystem(`totalIterationCap = ${chalk.cyan(setVal)}`);
+          return {};
+        default:
+          printSystem(`Unknown config key: ${setKey}`);
+          return {};
+      }
+    }
+
+    case 'reset':
+      config.reset();
+      printSystem(chalk.yellow('Config reset to defaults.'));
+      return { recreateBackend: true };
+
+    case 'apikey': {
+      if (arg) {
+        config.setLLM({ apiKey: arg });
+        printSystem(`API key updated for ${chalk.cyan(c.llm.provider)}.`);
+        return { recreateBackend: true };
+      }
+      const mask = (s?: string) => s ? s.slice(0, 4) + '****' + s.slice(-4) : chalk.dim('(not set)');
+      // Show primary
+      printSystem(`Primary (${chalk.cyan(c.llm.provider)}):  ${mask(c.llm.apiKey)}`);
+      // Show fallback
+      if (c.fallbackLlm) {
+        printSystem(`Fallback (${chalk.cyan(c.fallbackLlm.provider)}): ${mask(c.fallbackLlm.apiKey)}`);
+      }
+      if (askUser) {
+        const newKey = await askUser(`Primary API key for ${c.llm.provider} (Enter to keep):`);
+        let recreate = false;
+        if (newKey.trim()) {
+          config.setLLM({ apiKey: newKey.trim() });
+          printSystem('Primary API key updated.');
+          recreate = true;
+        }
+        if (c.fallbackLlm) {
+          const fbKey = await askUser(`Fallback API key for ${c.fallbackLlm.provider} (Enter to keep):`);
+          if (fbKey.trim()) {
+            config.set('fallbackLlm', { ...c.fallbackLlm, apiKey: fbKey.trim() });
+            printSystem('Fallback API key updated.');
+            recreate = true;
+          }
+        }
+        if (recreate) return { recreateBackend: true };
+      }
+      return {};
+    }
+
+    case 'fallback': {
+      if (arg === 'clear' || arg === 'off' || arg === 'none') {
+        config.set('fallbackLlm', undefined as any);
+        printSystem('Fallback LLM cleared.');
+        return { recreateBackend: true };
+      }
+      if (arg) {
+        const [prov, ...modelParts] = arg.split('/');
+        const model = modelParts.join('/') || 'gpt-4o';
+        config.set('fallbackLlm', {
+          provider: prov as import('../config/schema.js').LLMProvider,
+          model,
+          temperature: c.llm.temperature,
+          timeoutMs: c.llm.timeoutMs,
+        });
+        printSystem(`Fallback set to: ${chalk.cyan(`${prov}/${model}`)}`);
+        return { recreateBackend: true };
+      }
+      // Show current, then interactive select
+      if (c.fallbackLlm) {
+        printSystem(`Current fallback: ${chalk.cyan(`${c.fallbackLlm.provider}/${c.fallbackLlm.model}`)}`);
+      }
+      if (!rlRef) {
+        printSystem(chalk.dim('Usage: /config fallback <provider/model> or /config fallback clear'));
+        return {};
+      }
+      const { PROVIDER_MODELS } = await import('../llm/factory.js');
+      const PROVIDERS = Object.keys(PROVIDER_MODELS) as import('../config/schema.js').LLMProvider[];
+      const providerItems = [...PROVIDERS, chalk.dim('[ Clear fallback ]')];
+      const currentProvIdx = c.fallbackLlm ? PROVIDERS.indexOf(c.fallbackLlm.provider) : -1;
+      const selProvider = await interactiveSelect(rlRef, 'Fallback provider:', providerItems,
+        { highlight: Math.max(0, currentProvIdx) });
+      if (!selProvider) { printSystem('Cancelled.'); return {}; }
+      if (selProvider.includes('Clear fallback')) {
+        config.set('fallbackLlm', undefined as any);
+        printSystem('Fallback LLM cleared.');
+        return { recreateBackend: true };
+      }
+      const provider = selProvider as import('../config/schema.js').LLMProvider;
+      const models = PROVIDER_MODELS[provider] ?? [];
+      const modelItems = [...models, '[ Custom model name ]'];
+      const currentModelIdx = c.fallbackLlm?.provider === provider
+        ? models.indexOf(c.fallbackLlm.model) : -1;
+      const selModel = await interactiveSelect(rlRef, `${provider} models:`, modelItems,
+        { highlight: Math.max(0, currentModelIdx) });
+      if (!selModel) { printSystem('Cancelled.'); return {}; }
+      let model = selModel;
+      if (selModel === '[ Custom model name ]') {
+        if (!askUser) return {};
+        const custom = await askUser('Enter model name:');
+        if (!custom.trim()) { printSystem('Cancelled.'); return {}; }
+        model = custom.trim();
+      }
+      // Ask for API key (skip for ollama which doesn't need one)
+      let apiKey: string | undefined;
+      if (provider !== 'ollama' && askUser) {
+        const existingKey = c.fallbackLlm?.provider === provider ? c.fallbackLlm.apiKey : undefined;
+        const hint = existingKey ? ` [${existingKey.slice(0, 4)}****]` : '';
+        const keyInput = await askUser(`API key for ${provider}${hint} (Enter to skip):`);
+        apiKey = keyInput.trim() || existingKey;
+      }
+      // Ask for baseUrl if ollama or openai-compatible
+      let baseUrl: string | undefined;
+      if ((provider === 'ollama' || provider === 'openai-compatible') && askUser) {
+        const existingUrl = c.fallbackLlm?.provider === provider ? c.fallbackLlm.baseUrl : undefined;
+        const defaultUrl = provider === 'ollama' ? 'http://localhost:11434/v1' : '';
+        const hint = existingUrl ?? defaultUrl;
+        const urlInput = await askUser(`Base URL [${hint}] (Enter for default):`);
+        baseUrl = urlInput.trim() || hint || undefined;
+      }
+      config.set('fallbackLlm', {
+        provider,
+        model,
+        apiKey,
+        baseUrl,
+        temperature: c.llm.temperature,
+        timeoutMs: c.llm.timeoutMs,
+      });
+      printSystem(`Fallback set to: ${chalk.cyan.bold(`${provider}/${model}`)}`);
+      return { recreateBackend: true };
+    }
+
+    case 'simulator': {
+      if (arg) {
+        config.set('project', { ...c.project, defaultSimulator: arg });
+        printSystem(`Default simulator: ${chalk.cyan(arg)}`);
+        return {};
+      }
+      // Interactive select
+      if (rlRef) {
+        const sims = ['iverilog', 'verilator', 'vcs', 'xsim', 'modelsim'];
+        const selected = await interactiveSelect(rlRef, 'Select simulator:', sims,
+          { highlight: Math.max(0, sims.indexOf(c.project.defaultSimulator)) });
+        if (!selected) { printSystem('Cancelled.'); return {}; }
+        config.set('project', { ...c.project, defaultSimulator: selected });
+        printSystem(`Default simulator: ${chalk.cyan(selected)}`);
+      } else {
+        printSystem(`Current simulator: ${chalk.cyan(c.project.defaultSimulator)}`);
+      }
+      return {};
+    }
+
+    case 'hdl': {
+      if (arg) {
+        if (!HDL_STANDARDS.includes(arg as any)) {
+          printSystem(`Invalid. Options: ${HDL_STANDARDS.join(', ')}`);
+          return {};
+        }
+        config.set('project', { ...c.project, hdlStandard: arg as typeof HDL_STANDARDS[number] });
+        printSystem(`HDL standard: ${chalk.cyan(arg)}`);
+        return {};
+      }
+      if (rlRef) {
+        const selected = await interactiveSelect(rlRef, 'Select HDL standard:', [...HDL_STANDARDS],
+          { highlight: Math.max(0, HDL_STANDARDS.indexOf(c.project.hdlStandard)) });
+        if (!selected) { printSystem('Cancelled.'); return {}; }
+        config.set('project', { ...c.project, hdlStandard: selected as typeof HDL_STANDARDS[number] });
+        printSystem(`HDL standard: ${chalk.cyan(selected)}`);
+      } else {
+        printSystem(`Current HDL standard: ${chalk.cyan(c.project.hdlStandard)}`);
+      }
+      return {};
+    }
+
+    case 'device': {
+      if (arg) {
+        const val = arg === 'clear' || arg === 'none' ? undefined : arg;
+        config.set('project', { ...c.project, targetDevice: val });
+        printSystem(`Target device: ${chalk.cyan(val ?? '(cleared)')}`);
+        return {};
+      }
+      printSystem(`Target device: ${chalk.cyan(c.project.targetDevice ?? chalk.dim('(not set)'))}`);
+      if (askUser) {
+        const val = await askUser('Enter target device (empty to clear):');
+        config.set('project', { ...c.project, targetDevice: val.trim() || undefined });
+        printSystem(`Target device: ${chalk.cyan(val.trim() || '(cleared)')}`);
+      }
+      return {};
+    }
+
+    case 'timeout': {
+      if (arg) {
+        const ms = parseInt(arg);
+        if (isNaN(ms) || ms <= 0) { printSystem('Invalid timeout value.'); return {}; }
+        config.setLLM({ timeoutMs: ms });
+        printSystem(`Timeout: ${chalk.cyan(ms + 'ms')}`);
+        return {};
+      }
+      printSystem(`Current timeout: ${chalk.cyan(c.llm.timeoutMs + 'ms')}`);
+      return {};
+    }
+
+    case 'debug': {
+      if (arg) {
+        // /config debug <key> <value>
+        const [dKey, dVal] = arg.split(/\s+/);
+        if (!dKey || !dVal) {
+          printSystem('Usage: /config debug <key> <value>');
+          return {};
+        }
+        const num = parseInt(dVal);
+        if (isNaN(num)) { printSystem('Value must be a number.'); return {}; }
+        switch (dKey) {
+          case 'maxRetries':
+          case 'sameErrorMaxRetries':
+            config.set('debug', { ...c.debug, sameErrorMaxRetries: num });
+            break;
+          case 'iterationCap':
+          case 'totalIterationCap':
+            config.set('debug', { ...c.debug, totalIterationCap: num });
+            break;
+          case 'vcdTimeMarginNs':
+            config.set('debug', { ...c.debug, vcdTimeMarginNs: num });
+            break;
+          case 'maxSignalsPerQuery':
+            config.set('debug', { ...c.debug, maxSignalsPerQuery: num });
+            break;
+          default:
+            printSystem(`Unknown debug key: ${dKey}`);
+            return {};
+        }
+        printSystem(`debug.${dKey} = ${chalk.cyan(String(num))}`);
+        return {};
+      }
+      // Show debug config
+      const dkv = (key: string, val: string | number) =>
+        `  ${chalk.cyan(key.padEnd(24))}${val}`;
+      console.log([
+        '',
+        chalk.bold.hex('#FF22DD')('  Debug Config'),
+        dkv('sameErrorMaxRetries', c.debug.sameErrorMaxRetries),
+        dkv('totalIterationCap', c.debug.totalIterationCap),
+        dkv('vcdTimeMarginNs', c.debug.vcdTimeMarginNs),
+        dkv('maxSignalsPerQuery', c.debug.maxSignalsPerQuery),
+        '',
+        chalk.dim('  Pass patterns: ') + c.debug.passPatterns.join(', '),
+        chalk.dim('  Fail patterns: ') + c.debug.failPatterns.join(', '),
+        '',
+      ].join('\n'));
+      return {};
+    }
+
+    case 'path':
+      printSystem(`Config file: ${chalk.cyan(config.configPath)}`);
+      return {};
+
+    default:
+      printSystem('Usage: /config [show|set|reset|apikey|fallback|simulator|hdl|device|timeout|debug|path]');
+      return {};
+  }
+}
+
+async function handleProjectCommand(parts: string[], rlRef?: readline.Interface): Promise<CommandResult> {
+  const action = parts[1];
+  let arg = parts.slice(2).join(' ');
 
   const { ProjectManager } = await import('../project/manager.js');
   const pm = new ProjectManager();
@@ -1156,15 +1809,52 @@ async function handleProjectCommand(parts: string[]): Promise<CommandResult> {
       if (projects.length === 0) {
         printSystem('No projects found. Use /project init <name> or /project open <path>');
       } else {
+        const cwd = process.cwd() + path.sep;
+        const local = projects.filter(p => p.rootPath === process.cwd() || p.rootPath.startsWith(cwd));
+        const other = projects.filter(p => p.rootPath !== process.cwd() && !p.rootPath.startsWith(cwd));
         console.log();
-        for (const p of projects) {
-          console.log(`  ${chalk.cyan('\u25CF')} ${chalk.bold(p.name.padEnd(20))} ${chalk.dim(p.rootPath)}`);
+        if (local.length > 0) {
+          console.log(chalk.bold.hex('#00BBFF')('  Local'));
+          for (const p of local) {
+            console.log(`  ${chalk.cyan('\u25CF')} ${chalk.bold(p.name.padEnd(20))} ${chalk.dim(p.rootPath)}`);
+          }
+        }
+        if (other.length > 0) {
+          if (local.length > 0) console.log();
+          console.log(chalk.bold.dim('  Other'));
+          for (const p of other) {
+            console.log(`  ${chalk.dim('\u25CB')} ${p.name.padEnd(20)} ${chalk.dim(p.rootPath)}`);
+          }
         }
         console.log();
       }
       return {};
     }
     case 'open': {
+      // If no arg provided, show interactive project picker
+      if (!arg && rlRef) {
+        const projects = await pm.listProjects();
+        if (projects.length === 0) {
+          printSystem('No projects found. Use /project init <name> to create one.');
+          return {};
+        }
+        const cwd = process.cwd() + path.sep;
+        const sorted = [...projects].sort((a, b) => {
+          const aLocal = a.rootPath === process.cwd() || a.rootPath.startsWith(cwd);
+          const bLocal = b.rootPath === process.cwd() || b.rootPath.startsWith(cwd);
+          return aLocal === bLocal ? 0 : aLocal ? -1 : 1;
+        });
+        const names = sorted.map(p => {
+          const isLocal = p.rootPath === process.cwd() || p.rootPath.startsWith(cwd);
+          return isLocal ? p.name : `${p.name}  ${chalk.dim(p.rootPath)}`;
+        });
+        const selected = await interactiveSelect(rlRef, 'Select project:', names);
+        if (!selected) { printSystem('Cancelled.'); return {}; }
+        // Strip the dim path suffix if present to find the project
+        const selectedName = selected.split('  ')[0]!.trim();
+        const proj = sorted.find(p => p.name === selectedName);
+        if (proj) arg = proj.rootPath;
+      }
       if (!arg) { printSystem('Usage: /project open <path>'); return {}; }
       try {
         // Check EDA tools
@@ -1372,7 +2062,13 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     configManager.llm,
     configManager.config.fallbackLlm,
     (from, to, error) => {
-      printSystem(chalk.yellow(`⚡ Provider ${from} failed (${error.slice(0, 80)}), switching to ${to}`));
+      // Pause spinner so the message is not overwritten
+      const wasSpinning = spinner.isRunning;
+      spinner.stop();
+      console.log(); // ensure new line
+      printSystem(chalk.yellow.bold(`⚡ Provider ${from} failed (${error.slice(0, 80)})`));
+      printSystem(chalk.yellow(`   Switching to fallback: ${chalk.bold(to)}`));
+      if (wasSpinning) spinner.start('Thinking...');
     },
   );
   let orchestrator = new Orchestrator(backend);
@@ -1394,6 +2090,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
 
   // Dropdown command suggestions
   const suggestions = new CommandSuggestions(rl);
+  void suggestions.reloadProjects(); // Pre-cache project names
 
   // Monkey-patch _ttyWrite to intercept keys BEFORE readline processes them.
   // This lets us swallow Tab/Up/Down when the dropdown is open, avoiding
@@ -1435,8 +2132,18 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       return;
     }
 
-    // Enter → hide dropdown, let readline process the line
+    // Enter → if dropdown open, accept selection and execute; otherwise normal
     if (key?.name === 'return') {
+      if (dropdownOpen) {
+        const accepted = suggestions.accept();
+        if (accepted) {
+          (rl as any).line = accepted.trimEnd();
+          (rl as any).cursor = accepted.trimEnd().length;
+          readline.clearLine(process.stdout, 0);
+          readline.cursorTo(process.stdout, 0);
+          process.stdout.write((rl as any)._prompt + accepted.trimEnd());
+        }
+      }
       suggestions.hide();
       return origTtyWrite.call(this, s, key);
     }
@@ -1532,7 +2239,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     // Commands
     if (input.startsWith('/')) {
       suggestions.hide();
-      const result = await handleCommand(input, configManager, currentProjectPath, askUser);
+      const result = await handleCommand(input, configManager, currentProjectPath, askUser, rl);
       if (result.clearHistory) history.length = 0;
       if (result.recreateBackend) {
         try {
@@ -1540,7 +2247,12 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
             configManager.llm,
             configManager.config.fallbackLlm,
             (from, to, error) => {
-              printSystem(chalk.yellow(`⚡ Provider ${from} failed (${error.slice(0, 80)}), switching to ${to}`));
+              const wasSpinning = spinner.isRunning;
+              spinner.stop();
+              console.log();
+              printSystem(chalk.yellow.bold(`⚡ Provider ${from} failed (${error.slice(0, 80)})`));
+              printSystem(chalk.yellow(`   Switching to fallback: ${chalk.bold(to)}`));
+              if (wasSpinning) spinner.start('Thinking...');
             },
           );
           orchestrator = new Orchestrator(backend);
@@ -1557,6 +2269,8 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
           currentProjectName = result.projectName;
           projectMode = true;
         }
+        // Refresh cached project list for suggestions
+        void suggestions.reloadProjects();
       }
       // Update prompt based on mode
       rl.setPrompt(buildPrompt());
