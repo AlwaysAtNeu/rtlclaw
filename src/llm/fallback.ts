@@ -65,9 +65,9 @@ export class FallbackBackend extends LLMBackend {
     // The abandoned primary promise will eventually resolve/reject on its own;
     // its result is simply discarded.
     const timeoutMs = options?.timeoutMs ?? PRIMARY_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      let timer: ReturnType<typeof setTimeout>;
       const timeoutPromise = new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error(`Primary backend timed out after ${timeoutMs / 1000}s`)),
@@ -80,9 +80,10 @@ export class FallbackBackend extends LLMBackend {
         this.primary.complete(messages, options),
         timeoutPromise,
       ]);
-      clearTimeout(timer!);
+      clearTimeout(timer);
       return result;
     } catch (err) {
+      if (timer) clearTimeout(timer);
       const errMsg = err instanceof Error ? err.message : String(err);
       this.switchToFallback(errMsg);
       return this.fallback.complete(messages, options);
@@ -97,16 +98,34 @@ export class FallbackBackend extends LLMBackend {
       yield* this.fallback.stream(messages, options);
       return;
     }
+
+    // Same wall-clock timeout as complete() — if the primary stream
+    // hangs (accepts connection but never yields data), we need to
+    // switch to fallback. We use AbortController to break out of
+    // the for-await loop.
+    const timeoutMs = options?.timeoutMs ?? PRIMARY_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    if (timer.unref) timer.unref();
+
     try {
-      const iter = this.primary.stream(messages, options);
+      const iter = this.primary.stream(messages, {
+        ...options,
+        signal: controller.signal,
+      });
       let firstChunk = true;
       for await (const chunk of iter) {
         firstChunk = false;
         yield chunk;
       }
+      clearTimeout(timer);
       if (firstChunk) return;
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+      clearTimeout(timer);
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      const errMsg = isAbort
+        ? `Primary stream timed out after ${timeoutMs / 1000}s`
+        : (err instanceof Error ? err.message : String(err));
       this.switchToFallback(errMsg);
       yield* this.fallback.stream(messages, options);
     }
