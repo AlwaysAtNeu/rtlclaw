@@ -43,9 +43,15 @@ export function parseLLMResponse(text: string): { actions: Action[]; artifacts: 
     let filename = match[2] ?? '';
     const codeContent = match[3] ?? '';
 
-    // Fallback: look for a filename comment on the first line
+    // Fallback: look for a filename/path comment on the first line.
+    // Models may output various formats:
+    //   // filename: hw/src/hdl/counter.v
+    //   // File: hw/src/hdl/counter.v
+    //   // hw/src/hdl/counter.v
     if (!filename) {
-      const firstLineMatch = codeContent.match(/^\/\/\s*filename:\s*(\S+)/);
+      const firstLineMatch = codeContent.match(
+        /^\/\/\s*(?:file(?:name)?:\s*)?(\S+\.(?:s?vh?|svh))\s*$/m,
+      );
       if (firstLineMatch) filename = firstLineMatch[1]!;
     }
 

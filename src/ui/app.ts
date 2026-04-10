@@ -384,20 +384,37 @@ async function executeAction(
       let lintCmd = '';
       let lintResult = '';
 
-      // Use filelist for dependencies and include paths if available
+      // Lint uses -y (library search) instead of -f (file list) to avoid
+      // MODDUP — the filelist may already contain the target file.
+      // -y tells the tool to search directories for module definitions
+      // on demand; the standard EDA approach for single-file lint.
       const filelistPath = path.join(baseDir, flPath);
-      const filelistArg = existsSync(filelistPath) ? ` -f ${filelistPath}` : '';
+      let srcDirs: string[] = [];
+      let incPaths: string[] = [];   // raw paths without +incdir+ prefix
+      if (existsSync(filelistPath)) {
+        const flLines = (await fs.readFile(filelistPath, 'utf-8'))
+          .split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        incPaths = flLines.filter(l => l.startsWith('+incdir+')).map(l => l.slice(8));
+        srcDirs = [...new Set(
+          flLines
+            .filter(l => !l.startsWith('+') && !l.startsWith('-'))
+            .map(l => path.dirname(l)),
+        )];
+      }
+      const yArgs = srcDirs.map(d => `-y ${d}`).join(' ');
 
       try {
         await execAsync('which verilator', { signal });
-        lintCmd = `${envPrefix}verilator --lint-only -Wall${filelistArg} ${filePath} 2>&1 || true`;
+        const incArgs = incPaths.map(d => `+incdir+${d}`).join(' ');
+        lintCmd = `${envPrefix}verilator --lint-only -Wall ${yArgs} ${incArgs} ${filePath} 2>&1 || true`.replace(/ {2,}/g, ' ');
         lintResult = await execAsync(lintCmd, { cwd: baseDir, timeout: 30_000, signal });
         lintResult = lintResult || '  Lint: passed';
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') throw e;
         try {
           await execAsync('which iverilog', { signal });
-          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull${filelistArg} ${filePath} 2>&1 || true`;
+          const incArgs = incPaths.map(d => `-I ${d}`).join(' ');
+          lintCmd = `${envPrefix}iverilog ${iverilogGen} -tnull ${yArgs} ${incArgs} ${filePath} 2>&1 || true`.replace(/ {2,}/g, ' ');
           lintResult = await execAsync(lintCmd, { cwd: baseDir, timeout: 30_000, signal });
           lintResult = lintResult || '  Lint: passed';
         } catch (e2) {
@@ -493,13 +510,13 @@ async function executeAction(
         for (const tcFile of tcsToRun) {
           const tcFilePath = path.join(tcPath, tcFile);
           const tempTBPath = path.join(simDir, `tb_temp_${tcFile}`);
-          // Calculate TC path relative to where the temp TB file will be (simDir)
-          const tcRelPath = path.relative(simDir, tcFilePath);
-          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcRelPath}"`);
+          // Use just the filename in include — -I flag provides the search dir
+          const tempTBContent = tbContent.replace(/`include\s+"PLACEHOLDER_TC"/g, `\`include "${tcFile}"`);
           await fs.writeFile(tempTBPath, tempTBContent, 'utf-8');
 
           const vvpPath = path.join(simDir, `sim_${tcFile.replace(/\.\w+$/, '')}.vvp`);
-          const compileCmd = `${envPrefix}iverilog ${iverilogGen} -I ${tcPath} -o ${vvpPath} ${tempTBPath}${rtlSources} 2>&1`;
+          // TB/TC are always SystemVerilog (-g2012) regardless of RTL hdlStandard
+          const compileCmd = `${envPrefix}iverilog -g2012 -I ${tcPath} -o ${vvpPath} ${tempTBPath}${rtlSources} 2>&1`;
           const runCmd = `${envPrefix}vvp ${vvpPath} 2>&1`;
           const tcStartMs = Date.now();
           let tcOutput = '';
@@ -549,7 +566,8 @@ async function executeAction(
       } else {
         // ── Self-contained TB (no TC include) or no TCs ──
         const vvpPath = path.join(simDir, 'sim.vvp');
-        const compileCmd = `${envPrefix}iverilog ${iverilogGen} -o ${vvpPath} ${tbFilePath}${rtlSources} 2>&1`;
+        // TB/TC are always SystemVerilog (-g2012) regardless of RTL hdlStandard
+        const compileCmd = `${envPrefix}iverilog -g2012 -o ${vvpPath} ${tbFilePath}${rtlSources} 2>&1`;
         const runCmd = `${envPrefix}vvp ${vvpPath} 2>&1`;
         const simStartMs = Date.now();
         let simOutput = '';
