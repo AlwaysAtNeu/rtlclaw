@@ -427,7 +427,8 @@ async function executeAction(
 
           const vvpPath = path.join(simDir, `sim_${tcFile.replace(/\.\w+$/, '')}.vvp`);
           // TB/TC are always SystemVerilog (-g2012) regardless of RTL hdlStandard
-          const compileCmd = `${envPrefix}iverilog -g2012 -I ${tcPath} -o ${vvpPath} ${tempTBPath}${rtlSources} 2>&1`;
+          // -f filelist MUST come before TB so +incdir+ paths are registered first
+          const compileCmd = `${envPrefix}iverilog -g2012 -o ${vvpPath}${rtlSources} -I ${tcPath} ${tempTBPath} 2>&1`;
           const runCmd = `${envPrefix}vvp ${vvpPath} 2>&1`;
           const tcStartMs = Date.now();
           let tcOutput = '';
@@ -478,7 +479,8 @@ async function executeAction(
         // ── Self-contained TB (no TC include) or no TCs ──
         const vvpPath = path.join(simDir, 'sim.vvp');
         // TB/TC are always SystemVerilog (-g2012) regardless of RTL hdlStandard
-        const compileCmd = `${envPrefix}iverilog -g2012 -o ${vvpPath} ${tbFilePath}${rtlSources} 2>&1`;
+        // -f filelist MUST come before TB so +incdir+ paths are registered first
+        const compileCmd = `${envPrefix}iverilog -g2012 -o ${vvpPath}${rtlSources} ${tbFilePath} 2>&1`;
         const runCmd = `${envPrefix}vvp ${vvpPath} 2>&1`;
         const simStartMs = Date.now();
         let simOutput = '';
