@@ -10,8 +10,11 @@
  * 2. Functional errors: user-authorized escalation (spec is immutable ground truth)
  */
 
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import type { Message, ToolSchema, ToolCall } from '../llm/types.js';
 import type { StageContext, OutputChunk, LLMTraceEntry } from './types.js';
+import { execAsync, assertSafePath } from '../utils/exec.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,36 +81,33 @@ async function executeTool(
   toolName: string,
   args: Record<string, unknown>,
   projectPath: string,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const path = await import('node:path');
-  const fs = await import('node:fs/promises');
   const baseDir = projectPath;
 
   try {
     switch (toolName) {
       case 'list_files': {
-        const dirPath = path.resolve(baseDir, (args.path as string) ?? '.');
+        const dirPath = assertSafePath(baseDir, (args.path as string) ?? '.');
         const entries = await fs.readdir(dirPath, { withFileTypes: true });
         return entries.map(e => `${e.isDirectory() ? '[dir] ' : '      '}${e.name}`).join('\n');
       }
       case 'read_file': {
-        const filePath = path.resolve(baseDir, args.path as string);
+        const filePath = assertSafePath(baseDir, args.path as string);
         return await fs.readFile(filePath, 'utf-8');
       }
       case 'write_file': {
-        const filePath = path.resolve(baseDir, args.path as string);
+        const filePath = assertSafePath(baseDir, args.path as string);
         await fs.mkdir(path.dirname(filePath), { recursive: true });
         await fs.writeFile(filePath, args.content as string, 'utf-8');
         return `Wrote ${args.path}`;
       }
       case 'run_command': {
-        const { execSync } = await import('node:child_process');
         const cmd = args.command as string;
-        const output = execSync(cmd, {
+        const output = await execAsync(cmd, {
           cwd: baseDir,
-          encoding: 'utf-8',
           timeout: 120_000,
-          shell: '/bin/bash',
+          signal,
         });
         return output || '(no output)';
       }
@@ -115,6 +115,10 @@ async function executeTool(
         return `Unknown tool: ${toolName}`;
     }
   } catch (err) {
+    // Abort errors propagate up to cancel the tool loop
+    if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+      throw err;
+    }
     if (err instanceof Error && 'stdout' in err) {
       const execErr = err as { stdout?: string; stderr?: string };
       return `Command failed:\n${execErr.stdout || execErr.stderr || err.message}`;
@@ -231,6 +235,7 @@ export async function* runInfraDebug(
       response = await ctx.llm.complete(messages, {
         tools: INFRA_TOOLS,
         temperature: 0.1,
+        signal: ctx.signal,
       });
     } catch (err) {
       // If tool-calling not supported, fall back to text-only
@@ -280,7 +285,7 @@ export async function* runInfraDebug(
       let toolErrors = 0;
       for (const tc of response.toolCalls) {
         yield { type: 'progress', content: `  > ${tc.name}: ${JSON.stringify(tc.arguments).slice(0, 150)}` };
-        const result = await executeTool(tc.name, tc.arguments, ctx.projectPath);
+        const result = await executeTool(tc.name, tc.arguments, ctx.projectPath, ctx.signal);
         const isErr = result.startsWith('Error:') || result.startsWith('Command failed:');
         if (isErr) toolErrors++;
 
@@ -314,7 +319,7 @@ export async function* runInfraDebug(
           role: 'user',
           content: 'Tool call limit reached. Provide your final summary. Start with "RESOLVED:" or "UNRESOLVED:".',
         });
-        const finalResp = await ctx.llm.complete(messages, { temperature: 0.1 });
+        const finalResp = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
         if (finalResp.content) {
           fullContent += finalResp.content;
           yield { type: 'text', content: finalResp.content };

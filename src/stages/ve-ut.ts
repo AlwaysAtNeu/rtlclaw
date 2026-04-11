@@ -106,7 +106,7 @@ export async function* generateUTTestbench(
   const messages = buildVEUnitTBMessages(moduleName, portDefs, utVerificationReqs, interfaceContracts, p2Spec, globalParameters);
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.2 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   const blocks = parseLLMCodeBlocks(response.content);
@@ -253,7 +253,7 @@ export async function reviewTB(
   );
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.1 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   if (ctx.logTrace) {
@@ -456,7 +456,7 @@ export async function fixCompileErrors(
   const messages = buildVECompileFixMessages(moduleName, compileErrors, tbCode, extraContext);
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.1 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   const blocks = parseLLMCodeBlocks(response.content);
@@ -524,7 +524,7 @@ export async function auditSpecVsChecker(
   );
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.1 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   if (ctx.logTrace) {

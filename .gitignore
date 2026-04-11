@@ -6,3 +6,5 @@ dist/
 test*/
 untitled/
 .claude/
+.DS_Store
+docs/improvement-evaluation.md

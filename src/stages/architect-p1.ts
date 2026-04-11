@@ -425,7 +425,7 @@ export async function* runArchitectPhase1(
   try {
     const reqMessages = buildRequirementsAnalysisMessages(requirement);
     const reqStartMs = Date.now();
-    const reqResponse = await ctx.llm.complete(reqMessages, { temperature: 0.2 });
+    const reqResponse = await ctx.llm.complete(reqMessages, { temperature: 0.2, signal: ctx.signal });
     await logLLMTrace(ctx, reqResponse, 'architect_requirements_analysis', {
       durationMs: Date.now() - reqStartMs,
       promptChars: reqMessages.reduce((s, m) => s + m.content.length, 0),
@@ -508,6 +508,7 @@ export async function* runArchitectPhase1(
       response = await ctx.llm.complete(messages, {
         tools: [ARCHITECT_TOOL_SCHEMA as never],
         temperature: 0.3,
+        signal: ctx.signal,
       });
     } catch (err) {
       // If function calling is unsupported or timed out, fall back to JSON-mode completion
@@ -519,6 +520,7 @@ export async function* runArchitectPhase1(
         response = await ctx.llm.complete(messages, {
           temperature: 0.3,
           responseFormat: 'json',
+          signal: ctx.signal,
         });
       } catch (innerErr) {
         yield {
@@ -651,10 +653,11 @@ export async function* runArchitectPhase1(
           response = await ctx.llm.complete(revisionMessages, {
             tools: [ARCHITECT_TOOL_SCHEMA as never],
             temperature: 0.3,
+            signal: ctx.signal,
           });
         } catch {
           try {
-            response = await ctx.llm.complete(revisionMessages, { temperature: 0.3, responseFormat: 'json' });
+            response = await ctx.llm.complete(revisionMessages, { temperature: 0.3, responseFormat: 'json', signal: ctx.signal });
           } catch (innerErr) {
             yield {
               type: 'error',

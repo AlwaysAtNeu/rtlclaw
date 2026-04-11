@@ -16,8 +16,10 @@ import http2 from 'node:http2';
 /** Interval between HTTP/2 PING frames (ms). */
 const PING_INTERVAL_MS = 10_000;
 
-/** If no data received for this long during body streaming, treat as dead (ms). */
-const STREAM_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
+/** If no data received for this long during body streaming, treat as dead (ms).
+ *  Short value (90s) — detects dead connections. Normal streaming resets the
+ *  timer on each chunk so this won't fire during active responses. */
+const STREAM_IDLE_TIMEOUT_MS = 90_000; // 90 seconds
 
 /**
  * A minimal fetch()-compatible function that uses HTTP/2 with PING keep-alive.
@@ -30,6 +32,16 @@ const STREAM_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
 export function createH2Fetch(): typeof globalThis.fetch {
   // Cache one HTTP/2 session per origin for connection reuse
   const sessions = new Map<string, { session: http2.ClientHttp2Session; timer: ReturnType<typeof setInterval> }>();
+
+  // Clean up all sessions on process exit to avoid hanging
+  const cleanup = () => {
+    for (const { session, timer } of sessions.values()) {
+      clearInterval(timer);
+      if (!session.destroyed) session.destroy();
+    }
+    sessions.clear();
+  };
+  process.once('exit', cleanup);
 
   function getSession(origin: string): http2.ClientHttp2Session {
     const existing = sessions.get(origin);
@@ -211,14 +223,18 @@ export function createH2Fetch(): typeof globalThis.fetch {
             });
             // Handle premature stream closure: 'close' fires when the
             // HTTP/2 stream is destroyed without 'end' or 'error'.
-            // This happens when session.destroy() is called (PING failure)
-            // or the server sends RST_STREAM.
+            // This happens when session.destroy() is called (PING failure),
+            // the server sends RST_STREAM, or the user aborted via signal.
             req.on('close', () => {
               if (!ended) {
                 ended = true;
                 if (idleTimer) clearTimeout(idleTimer);
                 signal?.removeEventListener('abort', onAbort);
-                const err = new Error('HTTP/2 stream closed prematurely');
+                // If the signal was aborted, propagate as AbortError
+                // so the entire call chain recognizes it as user cancellation.
+                const err = signal?.aborted
+                  ? new DOMException('The operation was aborted.', 'AbortError')
+                  : new Error('HTTP/2 stream closed prematurely');
                 try { controller.error(err); } catch { /* already closed */ }
               }
             });

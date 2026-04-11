@@ -55,7 +55,11 @@ export class ConfigManager {
   }
 
   set<K extends keyof AppConfig>(key: K, value: AppConfig[K]): void {
-    this.store.set(key, value);
+    if (value === undefined) {
+      this.store.delete(key);
+    } else {
+      this.store.set(key, value);
+    }
   }
 
   setLLM(updates: Partial<LLMConfig>): void {

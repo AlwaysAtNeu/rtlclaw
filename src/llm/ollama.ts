@@ -53,11 +53,14 @@ export class OllamaBackend extends LLMBackend {
       body['format'] = 'json';
     }
 
+    // Combine user abort signal with timeout
+    const signals = [AbortSignal.timeout(this.timeoutMs)];
+    if (options?.signal) signals.push(options.signal);
     const response = await fetch(`${this.baseApiUrl}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.any(signals),
     });
 
     if (!response.ok) throw new Error(`Ollama error: ${response.status} ${response.statusText}`);
@@ -106,11 +109,13 @@ export class OllamaBackend extends LLMBackend {
       options: ollamaOpts,
     };
 
+    const signals = [AbortSignal.timeout(this.timeoutMs)];
+    if (options?.signal) signals.push(options.signal);
     const response = await fetch(`${this.baseApiUrl}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.any(signals),
     });
 
     if (!response.ok || !response.body) {

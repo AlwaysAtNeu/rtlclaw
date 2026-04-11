@@ -17,8 +17,8 @@
 import { LLMBackend } from './base.js';
 import type { LLMResponse, Message, StreamChunk, LLMCompleteOptions } from './types.js';
 
-/** Wall-clock timeout for primary backend complete() calls (ms). */
-const PRIMARY_TIMEOUT_MS = 300_000; // 5 minutes
+/** Default fallback timeout if not derivable from backend config (ms). */
+const DEFAULT_FALLBACK_TIMEOUT_MS = 600_000; // 10 minutes
 
 export class FallbackBackend extends LLMBackend {
   private primary: LLMBackend;
@@ -50,21 +50,20 @@ export class FallbackBackend extends LLMBackend {
     }
   }
 
+  /** Get the effective timeout: from options, primary backend config, or default. */
+  private getTimeoutMs(options?: LLMCompleteOptions): number {
+    return options?.timeoutMs ?? this.primary.configuredTimeoutMs ?? DEFAULT_FALLBACK_TIMEOUT_MS;
+  }
+
   async complete(messages: Message[], options?: LLMCompleteOptions): Promise<LLMResponse> {
     if (this.useFallback) {
       return this.fallback.complete(messages, options);
     }
 
-    // Race primary against a wall-clock timeout.
-    // This catches the case where the primary hangs indefinitely
-    // (server alive but never sends response data) — no error is thrown,
-    // so the catch block alone is insufficient.
-    //
-    // We use Promise.race instead of AbortController because not all
-    // backends propagate the signal (e.g. Anthropic SDK doesn't use it).
-    // The abandoned primary promise will eventually resolve/reject on its own;
-    // its result is simply discarded.
-    const timeoutMs = options?.timeoutMs ?? PRIMARY_TIMEOUT_MS;
+    // Safety-net timeout: slightly longer than the backend's own timeout
+    // so the backend's error (with detailed message) fires first in normal
+    // cases. This only fires if the backend hangs without throwing.
+    const timeoutMs = this.getTimeoutMs(options) + 30_000; // +30s margin
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     try {
@@ -84,6 +83,10 @@ export class FallbackBackend extends LLMBackend {
       return result;
     } catch (err) {
       if (timer) clearTimeout(timer);
+      // User-initiated abort — don't switch to fallback, just re-throw
+      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+        throw err;
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       this.switchToFallback(errMsg);
       return this.fallback.complete(messages, options);
@@ -99,14 +102,19 @@ export class FallbackBackend extends LLMBackend {
       return;
     }
 
-    // Same wall-clock timeout as complete() — if the primary stream
-    // hangs (accepts connection but never yields data), we need to
-    // switch to fallback. We use AbortController to break out of
-    // the for-await loop.
-    const timeoutMs = options?.timeoutMs ?? PRIMARY_TIMEOUT_MS;
+    // Idle timeout: resets on each chunk received. Only fires if the
+    // primary stream hangs (no data for timeoutMs). Long-but-active
+    // streams are not affected.
+    const timeoutMs = this.getTimeoutMs(options);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
     if (timer.unref) timer.unref();
+
+    const resetTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), timeoutMs);
+      if (timer.unref) timer.unref();
+    };
 
     try {
       const iter = this.primary.stream(messages, {
@@ -116,12 +124,17 @@ export class FallbackBackend extends LLMBackend {
       let firstChunk = true;
       for await (const chunk of iter) {
         firstChunk = false;
+        resetTimer();
         yield chunk;
       }
       clearTimeout(timer);
       if (firstChunk) return;
     } catch (err) {
       clearTimeout(timer);
+      // User-initiated abort — don't switch to fallback, just re-throw
+      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+        throw err;
+      }
       const isAbort = err instanceof Error && err.name === 'AbortError';
       const errMsg = isAbort
         ? `Primary stream timed out after ${timeoutMs / 1000}s`

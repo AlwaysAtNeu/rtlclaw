@@ -52,22 +52,35 @@ export const PROVIDER_MODELS: Record<LLMProvider, string[]> = {
 // ---------------------------------------------------------------------------
 
 const MODEL_MAX_TOKENS: Record<string, number> = {
+  // Gemini
   'gemini-3.1-pro-preview': 65536,
   'gemini-3-pro-preview': 65536,
   'gemini-2.5-flash': 65535,
   'gemini-2.5-pro': 65536,
+  // OpenAI
   'gpt-4.1': 32768,
+  'gpt-4.1-mini': 32768,
+  'gpt-4.1-nano': 32768,
   'gpt-4o': 16384,
+  'gpt-4o-mini': 16384,
   'o3': 100000,
   'o3-mini': 100000,
+  'o4-mini': 100000,
+  // Anthropic
   'claude-opus-4-20250514': 128000,
   'claude-sonnet-4-20250514': 64000,
   'claude-haiku-4-5-20251001': 64000,
-  'glm-4.7': 16384,
-  'glm-5': 16384,
-  'glm-5-turbo': 8192,
+  // 智谱 GLM — max output 128K per official docs
+  'glm-4.7': 131072,
+  'glm-5.1': 131072,
+  'glm-5': 131072,
+  'glm-5-turbo': 131072,
+  // DeepSeek
   'deepseek-chat': 8192,
+  'deepseek-reasoner': 8192,
+  // Kimi
   'moonshot-v1-128k': 4096,
+  // Qwen
   'qwen-max': 8192,
 };
 

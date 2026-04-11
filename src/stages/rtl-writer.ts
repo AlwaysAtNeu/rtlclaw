@@ -88,7 +88,7 @@ export async function* writeModule(
   // Build messages and call LLM (v3: pass interface contracts)
   const messages = buildRTLWriteMessages(phase2Design, dependentModulePorts, hdlStandard, interfaceContracts, previousLintError);
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages);
+  const response = await ctx.llm.complete(messages, { signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   // Parse code blocks from LLM output
@@ -207,7 +207,7 @@ export async function fixLintErrors(
   // Build messages and call LLM
   const messages = buildRTLLintFixMessages(moduleName, lintOutput, rtlCode, hdlStandard);
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages);
+  const response = await ctx.llm.complete(messages, { signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   // Parse the fixed code
@@ -266,7 +266,7 @@ export async function selectVCDSignals(
   const messages = buildSignalSelectMessages(moduleName, checkerOutput, signalList, funcDescription);
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.0 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.0, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   if (ctx.logTrace) {
@@ -347,7 +347,7 @@ export async function debugFix(
 
   const pChars = promptChars(messages);
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages);
+  const response = await ctx.llm.complete(messages, { signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   const responseText = response.content;

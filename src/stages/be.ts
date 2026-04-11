@@ -38,7 +38,7 @@ export async function* runBEStage(ctx: StageContext): AsyncGenerator<OutputChunk
   yield { type: 'progress', content: 'Generating synthesis constraints...' };
 
   const constraintMsgs = buildBEConstraintsMessages(ctx.designIndex, targetDevice);
-  const constraintResp = await ctx.llm.complete(constraintMsgs);
+  const constraintResp = await ctx.llm.complete(constraintMsgs, { signal: ctx.signal });
   const constraintContent = constraintResp.content;
 
   yield { type: 'text', content: constraintContent };
@@ -55,7 +55,7 @@ export async function* runBEStage(ctx: StageContext): AsyncGenerator<OutputChunk
   yield { type: 'progress', content: 'Generating synthesis script...' };
 
   const synthScriptMsgs = buildBESynthScriptMessages(topModule, targetDevice, ctx.filelistPath);
-  const synthScriptResp = await ctx.llm.complete(synthScriptMsgs);
+  const synthScriptResp = await ctx.llm.complete(synthScriptMsgs, { signal: ctx.signal });
   const synthScriptContent = synthScriptResp.content;
 
   yield { type: 'text', content: synthScriptContent };
@@ -81,7 +81,7 @@ export async function* runBEStage(ctx: StageContext): AsyncGenerator<OutputChunk
   yield { type: 'progress', content: 'Analyzing synthesis results...' };
 
   const analysisMsgs = buildBETimingAnalysisMessages(synthesisOutput, ctx.designIndex);
-  const analysisResp = await ctx.llm.complete(analysisMsgs);
+  const analysisResp = await ctx.llm.complete(analysisMsgs, { signal: ctx.signal });
   const analysisContent = analysisResp.content;
 
   yield { type: 'text', content: analysisContent };

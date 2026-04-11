@@ -28,6 +28,9 @@ import {
 import { getClawModePrompt } from './prompts.js';
 import type { LLMBackend } from '../llm/base.js';
 import type { Message, ToolSchema } from '../llm/types.js';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { execAsync, assertSafePath } from '../utils/exec.js';
 
 // Stage imports
 import type { StageContext, OutputChunk, LLMTraceEntry } from '../stages/types.js';
@@ -91,6 +94,8 @@ export interface OrchestratorContext {
   filelistPath?: string;
   /** Abort signal for cancelling in-flight operations (Ctrl+C) */
   signal?: AbortSignal;
+  /** Debug loop configuration (overrides hardcoded defaults) */
+  debugConfig?: { sameErrorMaxRetries?: number; totalIterationCap?: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +250,7 @@ export class Orchestrator {
   private static readonly CLAW_TOOLS: ToolSchema[] = [
     {
       name: 'run_command',
-      description: 'Run a shell command in the project directory and return its output. Use for: cleaning files, running EDA tools, checking status, etc.',
+      description: 'Run a shell command in the project directory and return its output.',
       parameters: {
         type: 'object',
         properties: {
@@ -316,37 +321,29 @@ export class Orchestrator {
     try {
       switch (toolName) {
         case 'run_command': {
-          const { execSync } = await import('node:child_process');
           const cmd = args.command as string;
-          const output = execSync(cmd, {
+          const output = await execAsync(cmd, {
             cwd: baseDir,
-            encoding: 'utf-8',
             timeout: 120_000,
-            shell: '/bin/bash',
+            signal: context.signal,
           });
           return output || '(no output)';
         }
         case 'read_file': {
-          const fs = await import('node:fs/promises');
-          const path = await import('node:path');
-          const filePath = path.resolve(baseDir, args.path as string);
+          const filePath = assertSafePath(baseDir, args.path as string);
           return await fs.readFile(filePath, 'utf-8');
         }
         case 'write_file': {
-          const fs = await import('node:fs/promises');
-          const path = await import('node:path');
-          const filePath = path.resolve(baseDir, args.path as string);
+          const filePath = assertSafePath(baseDir, args.path as string);
           await fs.mkdir(path.dirname(filePath), { recursive: true });
           await fs.writeFile(filePath, args.content as string, 'utf-8');
           return `Wrote ${args.path}`;
         }
         case 'delete_files': {
-          const fs = await import('node:fs/promises');
-          const path = await import('node:path');
           const paths = args.paths as string[];
           const results: string[] = [];
           for (const p of paths) {
-            const absPath = path.resolve(baseDir, p);
+            const absPath = assertSafePath(baseDir, p);
             try {
               await fs.rm(absPath, { recursive: true, force: true });
               results.push(`Deleted ${p}`);
@@ -357,9 +354,7 @@ export class Orchestrator {
           return results.join('\n');
         }
         case 'list_directory': {
-          const fs = await import('node:fs/promises');
-          const path = await import('node:path');
-          const dirPath = path.resolve(baseDir, (args.path as string) ?? '.');
+          const dirPath = assertSafePath(baseDir, (args.path as string) ?? '.');
           const entries = await fs.readdir(dirPath, { withFileTypes: true });
           return entries.map(e => `${e.isDirectory() ? '[dir] ' : '      '}${e.name}`).join('\n');
         }
@@ -367,6 +362,10 @@ export class Orchestrator {
           return `Unknown tool: ${toolName}`;
       }
     } catch (err) {
+      // Abort errors propagate up to cancel the tool loop
+      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+        throw err;
+      }
       // Return error as result so LLM can see what went wrong
       if (err instanceof Error && 'stdout' in err) {
         const execErr = err as { stdout?: string; stderr?: string };
@@ -561,6 +560,10 @@ export class Orchestrator {
     } catch (err) {
       // Don't show error for user-initiated abort (Ctrl+C)
       if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+        // Preserve partial output in history so context isn't lost
+        if (fullContent.trim()) {
+          context.history.push({ role: 'assistant', content: fullContent + '\n\n(interrupted)' });
+        }
         return;
       }
       yield { type: 'error', content: err instanceof Error ? err.message : String(err) };
@@ -1336,11 +1339,14 @@ export class Orchestrator {
       }
     }
 
-    while (mod.totalIterations < TOTAL_ITERATION_CAP) {
+    const iterCap = context.debugConfig?.totalIterationCap ?? TOTAL_ITERATION_CAP;
+    const sameErrCap = context.debugConfig?.sameErrorMaxRetries ?? SAME_ERROR_MAX_RETRIES;
+
+    while (mod.totalIterations < iterCap) {
       mod.totalIterations++;
       const sameCount = errorCounts.get(lastNormalizedError) ?? 0;
 
-      if (sameCount > SAME_ERROR_MAX_RETRIES) {
+      if (sameCount > sameErrCap) {
         yield* this.handleDebugExhausted(mod, context);
         // If counters were reset (user chose retry/infrastructure resolved), re-enter loop
         if (mod.status !== 'failed' && mod.status !== 'skipped' && mod.totalIterations === 0) {
@@ -1354,7 +1360,7 @@ export class Orchestrator {
 
       yield {
         type: 'progress',
-        content: `Debug iteration ${mod.totalIterations} for ${mod.name} (same-error: ${sameCount}/${SAME_ERROR_MAX_RETRIES})...`,
+        content: `Debug iteration ${mod.totalIterations} for ${mod.name} (same-error: ${sameCount}/${sameErrCap})...`,
       };
 
       // Log debug loop state
@@ -1367,7 +1373,7 @@ export class Orchestrator {
           durationMs: 0,
           event: 'debug_loop',
           taskContext: `debug_loop:${mod.name}`,
-          summary: `iter=${mod.totalIterations}/${TOTAL_ITERATION_CAP} same_err=${sameCount}/${SAME_ERROR_MAX_RETRIES} similar_checker=${consecutiveSimilarCheckerRounds} lint=${mod.lintAttempts} ve_compile=${mod.veCompileAttempts} tb_suspect=${mod.tbSuspectCount}`,
+          summary: `iter=${mod.totalIterations}/${iterCap} same_err=${sameCount}/${sameErrCap} similar_checker=${consecutiveSimilarCheckerRounds} lint=${mod.lintAttempts} ve_compile=${mod.veCompileAttempts} tb_suspect=${mod.tbSuspectCount}`,
         });
       }
 
@@ -2191,6 +2197,7 @@ export class Orchestrator {
         ? (state: WorkflowState) => context.saveState!(state)
         : async () => {},
       logTrace: context.logLLMTrace,
+      signal: context.signal,
     };
   }
 

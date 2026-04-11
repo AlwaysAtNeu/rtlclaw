@@ -3,7 +3,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { LLMBackend, type LLMBackendOptions } from './base.js';
+import { LLMBackend, TRANSIENT_PATTERN, type LLMBackendOptions } from './base.js';
 import { getMaxOutputTokens } from './factory.js';
 import type { LLMResponse, Message, StreamChunk, ToolCall, ToolSchema, LLMCompleteOptions } from './types.js';
 
@@ -77,11 +77,12 @@ export class AnthropicBackend extends LLMBackend {
     const { system, msgs } = this.convertMessages(messages);
 
     const maxTokens = options?.maxTokens ?? getMaxOutputTokens(this.providerName, this.model) ?? 4096;
-    const params: Anthropic.MessageCreateParamsNonStreaming = {
+    const params: Anthropic.MessageCreateParamsStreaming = {
       model: this.model,
       messages: msgs,
       max_tokens: maxTokens,
       temperature: options?.temperature ?? 0.2,
+      stream: true,
     };
     if (system) params.system = system;
     if (options?.tools?.length) params.tools = this.convertTools(options.tools);
@@ -91,7 +92,26 @@ export class AnthropicBackend extends LLMBackend {
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const response = await this.client.messages.create(params);
+        // Use streaming internally to keep the connection alive.
+        // Long-running requests (thinking models, large tool responses)
+        // can sit idle long enough for middleboxes to drop the connection.
+        // Signal is passed to SDK so abort works even during thinking phases
+        // (no events emitted → loop check alone is insufficient).
+        const reqOptions: Record<string, unknown> = {};
+        if (options?.signal) reqOptions.signal = options.signal;
+        const stream = this.client.messages.stream(params, reqOptions);
+
+        // Consume events to keep connection alive; check abort between events
+        // as a backup for SDKs that don't propagate signal fully
+        for await (const _event of stream) {
+          if (options?.signal?.aborted) {
+            stream.abort();
+            throw new DOMException('The operation was aborted.', 'AbortError');
+          }
+        }
+
+        // SDK assembles the full message including tool_use blocks
+        const response = await stream.finalMessage();
 
         let content = '';
         const toolCalls: ToolCall[] = [];
@@ -118,12 +138,16 @@ export class AnthropicBackend extends LLMBackend {
           },
         };
       } catch (err) {
+        // User-initiated abort — never retry
+        if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+          throw err;
+        }
         lastError = err;
         const msg = err instanceof Error ? err.message : String(err);
-        const isTransient = /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|overloaded|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(msg);
+        const isTransient = TRANSIENT_PATTERN.test(msg);
         if (!isTransient || attempt >= MAX_RETRIES) throw err;
         const delay = (attempt + 1) * 2000;
-        await new Promise(r => setTimeout(r, delay));
+        await this.abortableDelay(delay, options?.signal);
       }
     }
     throw lastError;
@@ -149,8 +173,14 @@ export class AnthropicBackend extends LLMBackend {
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const stream = this.client.messages.stream(params);
+        const reqOptions: Record<string, unknown> = {};
+        if (options?.signal) reqOptions.signal = options.signal;
+        const stream = this.client.messages.stream(params, reqOptions);
         for await (const event of stream) {
+          if (options?.signal?.aborted) {
+            stream.abort();
+            throw new DOMException('The operation was aborted.', 'AbortError');
+          }
           if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
             yield { content: event.delta.text, done: false };
           }
@@ -158,12 +188,15 @@ export class AnthropicBackend extends LLMBackend {
         yield { content: '', done: true };
         return;
       } catch (err) {
+        if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+          throw err;
+        }
         lastError = err;
         const msg = err instanceof Error ? err.message : String(err);
-        const isTransient = /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|overloaded|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(msg);
+        const isTransient = TRANSIENT_PATTERN.test(msg);
         if (!isTransient || attempt >= MAX_RETRIES) throw err;
         const delay = (attempt + 1) * 2000;
-        await new Promise(r => setTimeout(r, delay));
+        await this.abortableDelay(delay, options?.signal);
       }
     }
     throw lastError;

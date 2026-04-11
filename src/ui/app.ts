@@ -11,7 +11,6 @@ import * as readline from 'node:readline';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { existsSync } from 'node:fs';
-import { spawn } from 'node:child_process';
 import chalk from 'chalk';
 import type { ConfigManager } from '../config/manager.js';
 import type { LLMBackend } from '../llm/base.js';
@@ -23,95 +22,7 @@ import {
   type LLMTraceEntry,
 } from '../agents/orchestrator.js';
 import type { Action, DesignIndex, WorkflowState } from '../agents/types.js';
-
-// --------------------------------------------------------------------------
-// Async exec with abort support (replaces execSync to unblock event loop)
-// --------------------------------------------------------------------------
-
-interface ExecAsyncOptions {
-  cwd?: string;
-  encoding?: BufferEncoding;
-  timeout?: number;
-  shell?: string;
-  signal?: AbortSignal;
-}
-
-function execAsync(cmd: string, opts: ExecAsyncOptions = {}): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('sh', ['-c', cmd], {
-      cwd: opts.cwd ?? process.cwd(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: opts.shell,
-    });
-
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
-    child.stdout.on('data', (d: Buffer) => stdoutChunks.push(d.toString()));
-    child.stderr.on('data', (d: Buffer) => stderrChunks.push(d.toString()));
-
-    // Timeout
-    let timedOut = false;
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    if (opts.timeout && opts.timeout > 0) {
-      timeoutHandle = setTimeout(() => {
-        timedOut = true;
-        child.kill('SIGTERM');
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 3000);
-      }, opts.timeout);
-    }
-
-    // Abort signal (Ctrl+C)
-    if (opts.signal) {
-      if (opts.signal.aborted) {
-        child.kill('SIGTERM');
-        reject(new DOMException('The operation was aborted.', 'AbortError'));
-        return;
-      }
-      const onAbort = () => {
-        child.kill('SIGTERM');
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000);
-      };
-      opts.signal.addEventListener('abort', onAbort, { once: true });
-      child.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
-    }
-
-    child.on('error', (err) => {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      const stdout = stdoutChunks.join('');
-      const stderr = stderrChunks.join('');
-
-      // Check if aborted
-      if (opts.signal?.aborted) {
-        reject(new DOMException('The operation was aborted.', 'AbortError'));
-        return;
-      }
-
-      if (timedOut) {
-        const err: any = new Error(`Command timed out after ${opts.timeout}ms`);
-        err.stdout = stdout;
-        err.stderr = stderr;
-        reject(err);
-        return;
-      }
-
-      if (code !== 0) {
-        const err: any = new Error(`Command failed with exit code ${code}`);
-        err.stdout = stdout;
-        err.stderr = stderr;
-        err.status = code;
-        reject(err);
-        return;
-      }
-
-      resolve(stdout);
-    });
-  });
-}
+import { execAsync } from '../utils/exec.js';
 
 // --------------------------------------------------------------------------
 // Display helpers
@@ -851,6 +762,7 @@ const COMMANDS: CommandDef[] = [
     ],
   },
   { name: '/model', args: '[name]', description: 'Show or switch model' },
+  { name: '/swap', description: 'Swap primary ↔ fallback provider' },
   { name: '/provider', args: '<name>', description: 'Switch LLM provider' },
   {
     name: '/config', args: '<action>', description: 'Manage configuration',
@@ -1264,10 +1176,7 @@ async function handleCommand(
         options,
         { highlight: currentIdx >= 0 ? currentIdx : 0 },
       );
-      if (!selected) {
-        printSystem('Cancelled.');
-        return {};
-      }
+      if (!selected) { printSystem('Cancelled.'); return {}; }
       if (selected === '[ Custom model name ]') {
         if (!askUser) return {};
         const customName = await askUser('Enter model name:');
@@ -1282,6 +1191,20 @@ async function handleCommand(
       }
       config.setLLM({ model: selected });
       printSystem(`Model switched to: ${chalk.cyan.bold(selected)}`);
+      return { recreateBackend: true };
+    }
+    case '/swap': {
+      const fb = config.config.fallbackLlm;
+      if (!fb) {
+        printSystem('No fallback configured. Use /config fallback to set one.');
+        return {};
+      }
+      const oldPrimary: import('../config/schema.js').LLMConfig = { ...config.llm };
+      const oldFallback: import('../config/schema.js').LLMConfig = { ...fb };
+      config.setLLM({ provider: oldFallback.provider, model: oldFallback.model, apiKey: oldFallback.apiKey, baseUrl: oldFallback.baseUrl });
+      config.set('fallbackLlm', { provider: oldPrimary.provider, model: oldPrimary.model, apiKey: oldPrimary.apiKey, baseUrl: oldPrimary.baseUrl, temperature: oldPrimary.temperature, timeoutMs: oldPrimary.timeoutMs });
+      printSystem(`Primary:  ${chalk.cyan.bold(`${oldFallback.provider}/${oldFallback.model}`)}`);
+      printSystem(`Fallback: ${chalk.dim(`${oldPrimary.provider}/${oldPrimary.model}`)}`);
       return { recreateBackend: true };
     }
     case '/provider':
@@ -1357,7 +1280,20 @@ async function handleConfigEdit(
       const selected = await interactiveSelect(rlRef, 'Select provider:', PROVIDERS,
         { highlight: Math.max(0, PROVIDERS.indexOf(c.llm.provider)) });
       if (!selected) { printSystem('Cancelled.'); return {}; }
-      config.setLLM({ provider: selected as import('../config/schema.js').LLMProvider });
+      // Ask for baseUrl (proxy) if switching to a non-openai provider
+      let baseUrl: string | undefined;
+      if (selected !== 'openai' && askUser) {
+        const existing = c.llm.provider === selected ? c.llm.baseUrl : undefined;
+        const prompt = existing
+          ? `Base URL [${existing}] (Enter for default, proxy if needed):`
+          : `Base URL for ${selected} (Enter to skip, or proxy address):`;
+        const val = await askUser(prompt);
+        baseUrl = val.trim() || existing || undefined;
+      }
+      config.setLLM({
+        provider: selected as import('../config/schema.js').LLMProvider,
+        ...(baseUrl !== undefined ? { baseUrl } : {}),
+      });
       printSystem(`Provider: ${chalk.cyan(selected)}`);
       return { recreateBackend: true };
     }
@@ -1663,13 +1599,18 @@ async function handleConfigCommand(
         const keyInput = await askUser(`API key for ${provider}${hint} (Enter to skip):`);
         apiKey = keyInput.trim() || existingKey;
       }
-      // Ask for baseUrl if ollama or openai-compatible
+      // Ask for baseUrl — needed for proxied providers (e.g. Gemini in restricted regions), ollama, etc.
       let baseUrl: string | undefined;
-      if ((provider === 'ollama' || provider === 'openai-compatible') && askUser) {
+      if (askUser) {
         const existingUrl = c.fallbackLlm?.provider === provider ? c.fallbackLlm.baseUrl : undefined;
-        const defaultUrl = provider === 'ollama' ? 'http://localhost:11434/v1' : '';
-        const hint = existingUrl ?? defaultUrl;
-        const urlInput = await askUser(`Base URL [${hint}] (Enter for default):`);
+        const defaults: Record<string, string> = {
+          ollama: 'http://localhost:11434/v1',
+        };
+        const hint = existingUrl ?? defaults[provider] ?? '';
+        const prompt = hint
+          ? `Base URL [${hint}] (Enter for default, proxy address if needed):`
+          : `Base URL (Enter to skip, or proxy address for ${provider}):`;
+        const urlInput = await askUser(prompt);
         baseUrl = urlInput.trim() || hint || undefined;
       }
       config.set('fallbackLlm', {
@@ -2114,6 +2055,16 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
   // This lets us swallow Tab/Up/Down when the dropdown is open, avoiding
   // conflicts with readline's built-in completer and history navigation.
   const origTtyWrite = (rl as any)._ttyWrite;
+  // Detect Esc on raw stdin while readline is paused (busy).
+  // Esc = single 0x1b byte; arrow keys are 0x1b + '[' + letter (3+ bytes).
+  if (process.stdin.isTTY) {
+    process.stdin.on('data', (data: Buffer) => {
+      if (busy && data.length === 1 && data[0] === 0x1b) {
+        cancelCurrentOperation('Esc');
+      }
+    });
+  }
+
   (rl as any)._ttyWrite = function (s: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean; sequence?: string }) {
     if (busy || rlClosed) {
       return origTtyWrite.call(this, s, key);
@@ -2186,30 +2137,33 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
   };
 
   let rlClosed = false;
-  // AbortController for cancelling in-flight LLM requests on Ctrl+C
+  // AbortController for cancelling in-flight LLM requests
   let currentAbort: AbortController | null = null;
-  // Track whether SIGINT already handled the prompt restoration for the current operation
+  // Track whether cancel already handled prompt restoration for the current operation
   let sigintHandled = false;
 
-  // Handle Ctrl+C: if busy (LLM/sim running), abort current operation and return to prompt.
-  // If idle (waiting for input), exit the process.
+  // Shared cancel logic — called by both Esc and Ctrl+C
+  const cancelCurrentOperation = (source: string) => {
+    if (!busy) return;
+    spinner.stop();
+    if (currentAbort) {
+      currentAbort.abort();
+      currentAbort = null;
+    }
+    console.log(chalk.yellow(`\n  \u26A0 Operation cancelled (${source})`));
+    busy = false;
+    sigintHandled = true;
+    if (!rlClosed) {
+      rl.resume();
+      showPrompt();
+    }
+  };
+
+  // Ctrl+C: if busy → cancel operation, if idle → exit
   const handleSigint = () => {
     if (busy) {
-      // Abort in-flight operation
-      spinner.stop();
-      if (currentAbort) {
-        currentAbort.abort();
-        currentAbort = null;
-      }
-      console.log(chalk.yellow('\n  \u26A0 Operation cancelled (Ctrl+C)'));
-      busy = false;
-      sigintHandled = true;
-      if (!rlClosed) {
-        rl.resume();
-        showPrompt();
-      }
+      cancelCurrentOperation('Ctrl+C');
     } else {
-      // Idle — exit
       spinner.stop();
       console.log(chalk.dim('\n  Goodbye!\n'));
       process.exit(0);
@@ -2301,6 +2255,8 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     suggestions.pause();
     currentAbort = new AbortController();
     rl.pause();
+    // Keep stdin flowing so our raw 'data' listener can detect Esc
+    process.stdin.resume();
     printUser();
     spinner.start('Thinking...');
 
@@ -2314,6 +2270,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       hdlStandard: configManager.config.project.hdlStandard,
       targetDevice: configManager.config.project.targetDevice,
       signal: currentAbort?.signal,
+      debugConfig: configManager.config.debug,
       askUser,
       executeAction: (action: Action) => executeAction(action, currentProjectPath, configManager.config.project.hdlStandard, context.logLLMTrace, currentAbort?.signal, context.filelistPath),
     };
@@ -2360,7 +2317,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
       busy = false;
       currentAbort = null;
       suggestions.resume();
-      // Only restore prompt if SIGINT handler hasn't already done it
+      // Only restore prompt if cancel handler hasn't already done it
       if (!sigintHandled && !rlClosed) {
         rl.resume();
         showPrompt();

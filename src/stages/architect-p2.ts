@@ -151,7 +151,7 @@ export async function* runArchitectPhase2(
 
     let response: LLMResponse;
     try {
-      response = await ctx.llm.complete(messages, { temperature: 0.2 });
+      response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
     } catch (err) {
       yield {
         type: 'error',

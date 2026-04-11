@@ -3,7 +3,7 @@
  */
 
 import OpenAI from 'openai';
-import { LLMBackend, type LLMBackendOptions } from './base.js';
+import { LLMBackend, TRANSIENT_PATTERN, type LLMBackendOptions } from './base.js';
 import { getMaxOutputTokens } from './factory.js';
 import { createH2Fetch } from './h2-fetch.js';
 import type { LLMResponse, Message, StreamChunk, ToolCall, ToolSchema, LLMCompleteOptions } from './types.js';
@@ -13,15 +13,16 @@ export class OpenAIBackend extends LLMBackend {
 
   constructor(options: LLMBackendOptions) {
     super(options);
+    // HTTP/2 with PING keep-alive only for Gemini — thinking models have
+    // long idle periods that cause middleboxes to drop HTTP/1.1 connections.
+    // Other providers use default fetch (h2-fetch adds ~3.5x overhead).
+    const needsH2 = this.baseUrl?.includes('generativelanguage.googleapis');
     this.client = new OpenAI({
       apiKey: this.apiKey,
       baseURL: this.baseUrl,
-      timeout: 300_000,  // 5 min — streaming keeps connection alive; 5 min silence = dead connection, retry faster
+      timeout: this.timeoutMs,  // use configured value, not hardcoded 300s
       maxRetries: 0,
-      // Use HTTP/2 with PING keep-alive to prevent idle connection drops.
-      // Thinking models (Gemini 3.x, o3) have long idle periods during
-      // reasoning; HTTP/2 PING frames keep the connection alive.
-      fetch: createH2Fetch(),
+      ...(needsH2 ? { fetch: createH2Fetch() } : {}),
     });
   }
 
@@ -94,7 +95,9 @@ export class OpenAIBackend extends LLMBackend {
       temperature: options?.temperature ?? 0.2,
       ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
       stream: true,
-      stream_options: { include_usage: true },
+      ...(['openai', 'deepseek'].includes(this.providerName)
+        ? { stream_options: { include_usage: true } }
+        : {}),
     };
     if (options?.tools?.length) {
       params.tools = this.convertTools(options.tools);
@@ -124,6 +127,11 @@ export class OpenAIBackend extends LLMBackend {
         const toolCallMap = new Map<number, { id: string; name: string; args: string }>();
 
         for await (const chunk of stream) {
+          // Check abort signal between chunks for immediate cancellation
+          if (options?.signal?.aborted) {
+            stream.controller.abort();
+            throw new DOMException('The operation was aborted.', 'AbortError');
+          }
           const choice = chunk.choices[0];
           if (choice) {
             if (choice.delta?.content) {
@@ -172,23 +180,35 @@ export class OpenAIBackend extends LLMBackend {
 
         return { content, toolCalls, finishReason, usage: { promptTokens, completionTokens }, retryCount: attempt };
       } catch (err) {
+        // User-initiated abort — never retry, propagate immediately
+        if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+          throw err;
+        }
         lastError = err;
         const elapsedSec = ((Date.now() - startMs) / 1000).toFixed(1);
         const msg = err instanceof Error ? err.message : String(err);
         const cause = (err as any)?.cause;
         const causeMsg = cause ? ` (cause: ${cause instanceof Error ? cause.message : String(cause)})` : '';
         const errType = err?.constructor?.name ?? 'Error';
-        const detail = `[${errType}] ${msg}${causeMsg}`;
+        // Include HTTP status and response body from OpenAI SDK errors
+        const status = (err as any)?.status ?? '';
+        const respBody = (err as any)?.error ? JSON.stringify((err as any).error) : '';
+        const detail = `[${errType}] ${status ? `HTTP ${status} ` : ''}${msg}${causeMsg}${respBody ? `\n    Response: ${respBody}` : ''}`;
         // Retry on transient errors (timeout, network, 5xx)
         const fullMsg = msg + causeMsg;
-        const isTransient = /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(fullMsg);
+        const isTransient = TRANSIENT_PATTERN.test(fullMsg);
         if (!isTransient || attempt >= MAX_RETRIES) {
           process.stderr.write(`\n  [LLM] Request failed after ${elapsedSec}s (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${detail}\n`);
+          // Actionable hint for region-blocked APIs
+          const fullDetail = msg + respBody;
+          if (/location.*not supported|region.*not.*available|geo.*block/i.test(fullDetail)) {
+            process.stderr.write(`  [Hint] Your region may be blocked. Configure a proxy via /config → provider → Base URL.\n`);
+          }
           throw err;
         }
         process.stderr.write(`\n  [LLM] Request failed after ${elapsedSec}s (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${detail} — retrying in ${(attempt + 1) * 5}s...\n`);
         const delay = (attempt + 1) * 5000; // 5s, 10s
-        await new Promise(r => setTimeout(r, delay));
+        await this.abortableDelay(delay, options?.signal);
       }
     }
     throw lastError;
@@ -227,6 +247,10 @@ export class OpenAIBackend extends LLMBackend {
         }
         return; // Stream completed successfully
       } catch (err) {
+        // User-initiated abort — never retry, no error log
+        if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+          throw err;
+        }
         lastError = err;
         const elapsedSec = ((Date.now() - startMs) / 1000).toFixed(1);
         const msg = err instanceof Error ? err.message : String(err);
@@ -235,14 +259,14 @@ export class OpenAIBackend extends LLMBackend {
         const errType = err?.constructor?.name ?? 'Error';
         const detail = `[${errType}] ${msg}${causeMsg}`;
         const fullMsg = msg + causeMsg;
-        const isTransient = /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(fullMsg);
+        const isTransient = TRANSIENT_PATTERN.test(fullMsg);
         if (!isTransient || attempt >= MAX_RETRIES) {
           process.stderr.write(`\n  [LLM] Stream failed after ${elapsedSec}s (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${detail}\n`);
           throw err;
         }
         process.stderr.write(`\n  [LLM] Stream failed after ${elapsedSec}s (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${detail} — retrying in ${(attempt + 1) * 5}s...\n`);
         const delay = (attempt + 1) * 5000;
-        await new Promise(r => setTimeout(r, delay));
+        await this.abortableDelay(delay, options?.signal);
       }
     }
     throw lastError;

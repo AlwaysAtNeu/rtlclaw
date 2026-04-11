@@ -45,6 +45,8 @@ export interface StageContext {
   saveState: (state: WorkflowState) => Promise<void>;
   /** Log an LLM trace entry */
   logTrace?: (entry: LLMTraceEntry) => Promise<void>;
+  /** Abort signal for cancelling in-flight operations (Esc) */
+  signal?: AbortSignal;
 }
 
 // ---------------------------------------------------------------------------

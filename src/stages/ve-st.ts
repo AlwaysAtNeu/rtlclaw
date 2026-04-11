@@ -45,7 +45,7 @@ export async function* generateSTTestbench(
   );
 
   const startMs = Date.now();
-  const response = await ctx.llm.complete(messages, { temperature: 0.2 });
+  const response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
   if (ctx.logTrace) {

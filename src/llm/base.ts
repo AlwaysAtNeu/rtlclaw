@@ -11,6 +11,10 @@ export interface LLMBackendOptions {
   timeoutMs?: number;
 }
 
+/** Shared transient error detection pattern for retry logic. */
+export const TRANSIENT_PATTERN =
+  /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|overloaded|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i;
+
 export abstract class LLMBackend {
   protected model: string;
   protected apiKey?: string;
@@ -34,5 +38,25 @@ export abstract class LLMBackend {
     options?: LLMCompleteOptions & { signal?: AbortSignal },
   ): AsyncIterable<StreamChunk>;
 
+  /** Configured timeout in ms — used by FallbackBackend for layered timeout. */
+  get configuredTimeoutMs(): number { return this.timeoutMs; }
+
   abstract get providerName(): string;
+
+  /** Sleep that rejects immediately on abort signal, so Esc during retry delay works. */
+  protected abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+    if (!signal) return new Promise(r => setTimeout(r, ms));
+    if (signal.aborted) return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
 }
