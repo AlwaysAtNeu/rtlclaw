@@ -8,10 +8,11 @@
  * to the fallback without retrying the primary. This avoids noisy repeated
  * errors (e.g. Gemini 400 on every tool-calling round).
  *
- * Wall-clock timeout: complete() races the primary call against a deadline.
- * If the primary hangs (server accepts connection but never responds),
- * the timeout fires and triggers fallback. Without this, a hanging primary
- * blocks forever because no error is thrown for the catch block to handle.
+ * Idle timeout: both complete() and stream() use an idle-reset timer that
+ * resets whenever the primary backend reports activity (any streaming chunk,
+ * including reasoning/thinking tokens). Only fires if no data arrives for
+ * the configured timeout, preventing false switches for reasoning models
+ * that stream thinking tokens for extended periods.
  */
 
 import { LLMBackend } from './base.js';
@@ -60,34 +61,53 @@ export class FallbackBackend extends LLMBackend {
       return this.fallback.complete(messages, options);
     }
 
-    // Safety-net timeout: slightly longer than the backend's own timeout
-    // so the backend's error (with detailed message) fires first in normal
-    // cases. This only fires if the backend hangs without throwing.
-    const timeoutMs = this.getTimeoutMs(options) + 30_000; // +30s margin
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Idle timeout: resets whenever the primary backend reports chunk activity
+    // (any streaming data, including reasoning/thinking tokens).
+    // This replaces the old wall-clock Promise.race timeout that couldn't
+    // distinguish "model actively thinking" from "connection dead", causing
+    // false fallback switches for reasoning models like GLM-5.1.
+    const timeoutMs = this.getTimeoutMs(options);
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
+    if (timer.unref) timer.unref();
+
+    const resetTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), timeoutMs);
+      if (timer.unref) timer.unref();
+    };
+
+    // Link user's abort signal to our controller so Esc propagates
+    const userSignal = options?.signal;
+    const onUserAbort = () => controller.abort();
+    if (userSignal?.aborted) {
+      clearTimeout(timer);
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+    userSignal?.addEventListener('abort', onUserAbort, { once: true });
 
     try {
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`Primary backend timed out after ${timeoutMs / 1000}s`)),
-          timeoutMs,
-        );
-        if (timer.unref) timer.unref();
+      const result = await this.primary.complete(messages, {
+        ...options,
+        signal: controller.signal,
+        onActivity: resetTimer,
       });
-
-      const result = await Promise.race([
-        this.primary.complete(messages, options),
-        timeoutPromise,
-      ]);
       clearTimeout(timer);
+      userSignal?.removeEventListener('abort', onUserAbort);
       return result;
     } catch (err) {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
+      userSignal?.removeEventListener('abort', onUserAbort);
       // User-initiated abort — don't switch to fallback, just re-throw
-      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+      if (userSignal?.aborted) {
         throw err;
       }
-      const errMsg = err instanceof Error ? err.message : String(err);
+      // Idle timeout or other error → switch to fallback
+      const errMsg = err instanceof Error
+        ? (err.name === 'AbortError'
+          ? `Primary backend idle timeout after ${timeoutMs / 1000}s`
+          : err.message)
+        : String(err);
       this.switchToFallback(errMsg);
       return this.fallback.complete(messages, options);
     }
@@ -116,6 +136,15 @@ export class FallbackBackend extends LLMBackend {
       if (timer.unref) timer.unref();
     };
 
+    // Link user's abort signal to our controller so Esc propagates
+    const userSignal = options?.signal;
+    const onUserAbort = () => controller.abort();
+    if (userSignal?.aborted) {
+      clearTimeout(timer);
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+    userSignal?.addEventListener('abort', onUserAbort, { once: true });
+
     try {
       const iter = this.primary.stream(messages, {
         ...options,
@@ -128,17 +157,21 @@ export class FallbackBackend extends LLMBackend {
         yield chunk;
       }
       clearTimeout(timer);
+      userSignal?.removeEventListener('abort', onUserAbort);
       if (firstChunk) return;
     } catch (err) {
       clearTimeout(timer);
+      userSignal?.removeEventListener('abort', onUserAbort);
       // User-initiated abort — don't switch to fallback, just re-throw
-      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'))) {
+      if (userSignal?.aborted) {
         throw err;
       }
-      const isAbort = err instanceof Error && err.name === 'AbortError';
-      const errMsg = isAbort
-        ? `Primary stream timed out after ${timeoutMs / 1000}s`
-        : (err instanceof Error ? err.message : String(err));
+      // Idle timeout or other error → switch to fallback
+      const errMsg = err instanceof Error
+        ? (err.name === 'AbortError'
+          ? `Primary stream idle timeout after ${timeoutMs / 1000}s`
+          : err.message)
+        : String(err);
       this.switchToFallback(errMsg);
       yield* this.fallback.stream(messages, options);
     }

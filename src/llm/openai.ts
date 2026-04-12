@@ -132,6 +132,8 @@ export class OpenAIBackend extends LLMBackend {
             stream.controller.abort();
             throw new DOMException('The operation was aborted.', 'AbortError');
           }
+          // Any chunk (content, reasoning_content, tool_calls) = connection alive
+          options?.onActivity?.();
           const choice = chunk.choices[0];
           if (choice) {
             if (choice.delta?.content) {

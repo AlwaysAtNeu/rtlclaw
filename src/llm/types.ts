@@ -60,4 +60,6 @@ export interface LLMCompleteOptions {
   timeoutMs?: number;
   /** Abort signal for cancelling the request */
   signal?: AbortSignal;
+  /** Called on any streaming chunk arrival (including reasoning/thinking tokens) — keepalive signal for idle timeout reset */
+  onActivity?: () => void;
 }

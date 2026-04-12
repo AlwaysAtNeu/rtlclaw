@@ -108,6 +108,8 @@ export class AnthropicBackend extends LLMBackend {
             stream.abort();
             throw new DOMException('The operation was aborted.', 'AbortError');
           }
+          // Any event (thinking, text, tool_use) = connection alive
+          options?.onActivity?.();
         }
 
         // SDK assembles the full message including tool_use blocks
