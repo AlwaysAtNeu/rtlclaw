@@ -389,28 +389,31 @@ export const SPEC_CHECKER_AUDIT_PROMPT = `You are a verification auditor. Your j
 You will receive:
 1. The functional specification (from the Architect's detailed design)
 2. The testbench checker code (the relevant checker task or comparison logic)
-3. The checker failure output: expected value, actual value, and when it occurred
+3. The test case (TC) file(s) — provide the stimulus that drives the DUT; the checker's expected value at failure time is a function of these inputs
+4. The checker failure output: expected value, actual value, and when it occurred
 
-Your task — be CONCLUSIVE, not speculative:
-- Compare EACH checker's computation logic against the spec clause it is meant to verify
-- For the failing checker specifically: trace the expected value computation step by step
-- Determine: does the checker correctly compute what the spec says?
+Your task — be CONCLUSIVE, not speculative.  Use the TC stimulus as ground truth for what inputs the DUT received:
+- Read the TC to determine what inputs were applied at each relevant time/cycle
+- Trace the checker's expected-value computation step by step, substituting the actual stimulus values from the TC
+- Compare the traced expected value with the value the spec requires for those inputs
+- For the failing checker specifically: is the mismatch because the CHECKER computed the wrong expected value (checker bug), or because the RTL produced the wrong actual value (RTL bug)?
 
 Respond with JSON ONLY:
 \`\`\`json
 {
   "checkerCorrect": true/false,
-  "analysis": "Step-by-step comparison of spec vs checker logic",
-  "mismatch": "If checkerCorrect=false: exactly what the spec says vs what the checker computes",
+  "analysis": "Step-by-step comparison of spec vs checker logic, citing specific TC stimulus values used in the trace",
+  "mismatch": "If checkerCorrect=false: exactly what the spec says vs what the checker computes (with the TC inputs plugged in)",
   "specClause": "The specific spec text that the checker is verifying",
   "recommendation": "fix_tb" or "fix_rtl" — which one needs to change based on the evidence"
 }
 \`\`\`
 
 Rules:
-- Do NOT guess. Trace the logic.
-- If the checker computes expected=X but the spec clearly says the value should be Y, the checker is WRONG.
-- If the checker correctly computes expected=X per spec but RTL produces Y, the RTL is WRONG.
+- Do NOT guess. Trace the logic through the TC stimulus.
+- If the checker computes expected=X for the given TC inputs but the spec clearly says the value should be Y for those inputs, the checker is WRONG.
+- If the checker correctly computes expected=X per spec (for the given TC inputs) but RTL produces Y, the RTL is WRONG.
+- If the TC itself drives the DUT incorrectly (violates protocol, sets impossible inputs), note it — that is a TC bug, also fix_tb.
 - "I'm not sure" is not acceptable. Follow the logic to a conclusion.`;
 
 // ---------------------------------------------------------------------------

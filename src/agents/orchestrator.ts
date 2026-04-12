@@ -2402,8 +2402,19 @@ export class Orchestrator {
 
   private normalizeError(error: string): string {
     return error
-      .replace(/time\s+\d+/gi, 'time N')          // simulation timestamps
-      .replace(/#\s*\d+/g, '# N')                  // delay values
+      // Timestamps / delays / cycle counters
+      .replace(/time\s+\d+/gi, 'time N')
+      .replace(/#\s*\d+/g, '# N')
+      .replace(/\b(cycle|iteration|round|step)\s+\d+/gi, '$1 N')
+      // Verilog literals: 8'hFF, 32'b01xx, 16'd123 → N'X (width irrelevant for same-error match)
+      .replace(/\b\d+\s*'\s*[bhdoBHDO]\s*[0-9a-fA-F_xzXZ?]+/g, "N'X")
+      // C-style hex literals: 0xDEADBEEF → 0xN
+      .replace(/\b0x[0-9a-fA-F]+\b/gi, '0xN')
+      // Numeric value after = / == / != / < / > / <= / >= (but not bit ranges [3:0] — no `:` here)
+      .replace(/([=<>!]=?\s*)-?\d+(\.\d+)?/g, '$1N')
+      // Numeric value after common reporting words: expected 10, got 7, actual=42, value: 3
+      .replace(/\b(expected|actual|got|observed|value|result)\s*[:=]?\s*-?\d+(\.\d+)?\b/gi, '$1 N')
+      // Collapse whitespace and cap length
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 500);
