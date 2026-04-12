@@ -1346,7 +1346,7 @@ export class Orchestrator {
       mod.totalIterations++;
       const sameCount = errorCounts.get(lastNormalizedError) ?? 0;
 
-      if (sameCount > sameErrCap) {
+      if (sameCount >= sameErrCap) {
         yield* this.handleDebugExhausted(mod, context);
         // If counters were reset (user chose retry/infrastructure resolved), re-enter loop
         if (mod.status !== 'failed' && mod.status !== 'skipped' && mod.totalIterations === 0) {
@@ -2410,10 +2410,13 @@ export class Orchestrator {
       .replace(/\b\d+\s*'\s*[bhdoBHDO]\s*[0-9a-fA-F_xzXZ?]+/g, "N'X")
       // C-style hex literals: 0xDEADBEEF → 0xN
       .replace(/\b0x[0-9a-fA-F]+\b/gi, '0xN')
-      // Numeric value after = / == / != / < / > / <= / >= (but not bit ranges [3:0] — no `:` here)
-      .replace(/([=<>!]=?\s*)-?\d+(\.\d+)?/g, '$1N')
-      // Numeric value after common reporting words: expected 10, got 7, actual=42, value: 3
-      .replace(/\b(expected|actual|got|observed|value|result)\s*[:=]?\s*-?\d+(\.\d+)?\b/gi, '$1 N')
+      // Value after = / == / != / < / > / <= / >= — decimal OR bare hex (e.g. =aa, =00, =ff)
+      // First char must be hex digit (0-9a-fA-F) to avoid matching identifiers like "null".
+      // Trailing lookahead ensures we stop at a token boundary so "addr1" is not mis-matched
+      // (the `r` is not in the hex class, so the match would break before the boundary).
+      .replace(/([=<>!]=?\s*)-?[0-9a-fA-F][0-9a-fA-F_xzXZ?]*(?:\.[0-9]+)?(?=[\s,;:)\]}\n]|$)/gi, '$1N')
+      // Value after common reporting words — accepts decimal, bare hex, or mixed (e.g. "expected aa", "got 0")
+      .replace(/\b(expected|actual|got|observed|value|result|exp|act)\s*[:=]?\s*-?[0-9a-fA-F][0-9a-fA-F_xzXZ?]*(?:\.[0-9]+)?(?=[\s,;:)\]}\n]|$)/gi, '$1 N')
       // Collapse whitespace and cap length
       .replace(/\s+/g, ' ')
       .trim()
