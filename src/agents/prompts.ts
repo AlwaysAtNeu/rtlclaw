@@ -363,16 +363,21 @@ export const VE_TB_REVIEW_PROMPT = `You are the Verification Engineer reviewing 
 
 You will receive:
 - The Designer's reason for questioning the testbench
-- The testbench source code
+- The testbench (TB) source code — contains the DUT instance, clock/reset, and checker logic
+- The test case (TC) file(s) — contain stimulus and scenario; included into the TB via \`\`\`include "PLACEHOLDER_TC"\`\`\` at compile time
 - The verification requirements from the Architect
 
-Analyze whether the testbench is correct:
-1. If the TB is correct, explain why and say "TB is correct."
-2. If the TB has a bug, fix it and output the corrected file:
+Analyze whether the test (TB + TC together) is correct:
+1. If TB and TCs are both correct, explain why and say "TB is correct."
+2. If there is a bug, fix it and output the corrected file(s) — the bug may be in the TB, in a TC, or both:
    \`\`\`systemverilog hw/dv/ut/sim/tb/tb_module_name.sv
    // corrected testbench
    \`\`\`
+   \`\`\`systemverilog hw/dv/ut/sim/tc/tc_module_name_xxx.sv
+   // corrected test case
+   \`\`\`
 
+Output only the file(s) that need changes.  Always use the full path on the fence line.
 All code and comments in English.`;
 
 // ---------------------------------------------------------------------------
@@ -635,18 +640,19 @@ export const VE_COMPILE_FIX_PROMPT = `You are the Verification Engineer fixing c
 
 You will receive:
 - The compilation error output
-- The testbench/test case source code
+- The testbench (TB) source code — hw/dv/ut/sim/tb/tb_<module>.sv
+- The test case (TC) source code — hw/dv/ut/sim/tc/tc_<module>_*.sv (TCs are included into the TB at compile time via \`\`\`include "PLACEHOLDER_TC"\`\`\`)
 - (Optional) Project file structure and related source files for context
 
-Fix the compilation errors and output the complete corrected file(s):
-\`\`\`systemverilog <file_path>
+The compile error could be in the TB OR in a TC — read the error carefully to identify which file has the issue.  Fix only the file(s) with problems and output the complete corrected file(s):
+\`\`\`systemverilog <full_file_path>
 // corrected code
 \`\`\`
 
-You may output multiple code blocks if multiple files need fixing.
+You may output multiple code blocks if multiple files need fixing.  Always use the full path on the fence line (e.g. \`hw/dv/ut/sim/tb/tb_foo.sv\` or \`hw/dv/ut/sim/tc/tc_foo_basic.sv\`).
 
 Common issues and fixes:
-- Undeclared signals, type mismatches, missing module ports, syntax errors → fix in TB/TC
+- Undeclared signals, type mismatches, missing module ports, syntax errors → fix in TB or TC (whichever declares/uses the signal)
 - Include file not found → fix the \`include path to match actual file locations shown in file structure
 - Missing module definition → check if the module file is in the filelist; if not, note it
 - Wrong port connections → fix port names/widths to match the module definition

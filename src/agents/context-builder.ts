@@ -409,8 +409,15 @@ export function buildVETBReviewMessages(
   designerReason: string,
   tbCode: string,
   verificationReqs: string,
+  tcs: Array<{ path: string; content: string }>,
   functionalSpec?: string,
 ): Message[] {
+  const tcSection = tcs.length > 0
+    ? `\n\nTest case file(s) — these are included into the TB via \`\`\`include "PLACEHOLDER_TC"\`\`\` at compile time.  They contain the stimulus and scenario; the bug may be in a TC rather than the TB.\n${tcs
+        .map(tc => `\`\`\`systemverilog ${tc.path}\n${tc.content}\n\`\`\``)
+        .join('\n\n')}`
+    : '\n\n(No test case files found for this module.)';
+
   return [
     { role: 'system', content: VE_TB_REVIEW_PROMPT },
     {
@@ -419,10 +426,10 @@ export function buildVETBReviewMessages(
 
 Designer's reason: ${designerReason}
 
-Testbench code:
-\`\`\`
+Testbench code (hw/dv/ut/sim/tb/tb_${moduleName}.sv):
+\`\`\`systemverilog
 ${tbCode}
-\`\`\`
+\`\`\`${tcSection}
 
 Verification requirements (from Architect):
 ${verificationReqs}${functionalSpec ? `\n\nFunctional specification (from Architect P2):\n${functionalSpec}` : ''}`,
@@ -515,17 +522,24 @@ export function buildVECompileFixMessages(
   moduleName: string,
   compileErrors: string,
   tbCode: string,
+  tcs: Array<{ path: string; content: string }>,
   extraContext?: string,
 ): Message[] {
-  let content = `Fix compilation errors in testbench for module "${moduleName}".
+  const tcSection = tcs.length > 0
+    ? `\n\nTest case file(s) — included into the TB during compile; errors may be in a TC:\n${tcs
+        .map(tc => `\`\`\`systemverilog ${tc.path}\n${tc.content}\n\`\`\``)
+        .join('\n\n')}`
+    : '';
+
+  let content = `Fix compilation errors in testbench/test case for module "${moduleName}".
 
 Compilation errors:
 ${compileErrors}
 
-Testbench/test case code:
-\`\`\`
+Testbench (hw/dv/ut/sim/tb/tb_${moduleName}.sv):
+\`\`\`systemverilog
 ${tbCode}
-\`\`\``;
+\`\`\`${tcSection}`;
 
   if (extraContext) {
     content += `\n\n${extraContext}`;
@@ -546,7 +560,14 @@ export function buildSpecCheckerAuditMessages(
   functionalSpec: string,
   checkerCode: string,
   checkerOutput: string,
+  tcs: Array<{ path: string; content: string }>,
 ): Message[] {
+  const tcSection = tcs.length > 0
+    ? `\n\nTest case file(s) — provide stimulus that drives the DUT; expected values in the checker are computed against these inputs:\n${tcs
+        .map(tc => `\`\`\`systemverilog ${tc.path}\n${tc.content}\n\`\`\``)
+        .join('\n\n')}`
+    : '';
+
   return [
     { role: 'system', content: SPEC_CHECKER_AUDIT_PROMPT },
     {
@@ -557,9 +578,9 @@ Functional specification (from Architect P2):
 ${functionalSpec}
 
 Testbench checker code:
-\`\`\`
+\`\`\`systemverilog
 ${checkerCode}
-\`\`\`
+\`\`\`${tcSection}
 
 Checker failure output:
 ${checkerOutput}`,

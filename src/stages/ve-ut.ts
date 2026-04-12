@@ -24,6 +24,45 @@ function promptChars(msgs: Message[]): number {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: read all TC files for a module
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads all test case files for a module from hw/dv/ut/sim/tc/.
+ * TCs are included into the TB via `include "PLACEHOLDER_TC"` during compile,
+ * so the VE needs to see TC contents to debug the full test flow.
+ *
+ * Filters by files whose names contain the module name; falls back to all
+ * TCs in the directory if no module-specific TCs are found.
+ */
+export async function readModuleTCs(
+  ctx: StageContext,
+  moduleName: string,
+): Promise<Array<{ path: string; content: string }>> {
+  const tcDir = 'hw/dv/ut/sim/tc';
+  let files: string[] = [];
+  try {
+    const { readdirSync, existsSync } = await import('node:fs');
+    const nodePath = await import('node:path');
+    const abs = nodePath.join(ctx.projectPath, tcDir);
+    if (!existsSync(abs)) return [];
+    files = readdirSync(abs).filter(f => f.endsWith('.v') || f.endsWith('.sv'));
+  } catch { return []; }
+
+  const moduleTCs = files.filter(f => f.includes(moduleName));
+  const selected = moduleTCs.length > 0 ? moduleTCs : files;
+
+  const result: Array<{ path: string; content: string }> = [];
+  for (const f of selected) {
+    try {
+      const content = await ctx.readFile(`${tcDir}/${f}`);
+      result.push({ path: `${tcDir}/${f}`, content });
+    } catch { /* skip unreadable */ }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: parse fenced code blocks from LLM output
 // ---------------------------------------------------------------------------
 
@@ -244,11 +283,16 @@ export async function reviewTB(
     tbPath = tbPathV;
   }
 
+  // TB uses `include "PLACEHOLDER_TC"` — stimulus/expected values live in TCs.
+  // VE must see TCs to correctly judge whether the TB (or TCs) have a bug.
+  const tcs = await readModuleTCs(ctx, moduleName);
+
   const messages = buildVETBReviewMessages(
     moduleName,
     designerReason,
     tbCode,
     verificationReqs,
+    tcs,
     functionalSpec,
   );
 
@@ -299,15 +343,25 @@ export async function reviewTB(
   const reasonMatch = response.content.match(/^([\s\S]*?)```/);
   const fixReason = reasonMatch?.[1]?.trim() || 'TB had issues (see fixed code)';
 
-  // VE provided a fix — extract and write it
+  // VE provided a fix — extract and write it.  VE may return fixes for
+  // multiple files (TB and/or TCs); route each block to its identified
+  // path, defaulting to TB path for blocks without a clear target.
   const blocks = parseLLMCodeBlocks(response.content);
   if (blocks.length > 0) {
-    const fixedContent = blocks[0].content;
-    await ctx.executeAction({
-      type: 'writeFile',
-      payload: { path: tbPath, content: fixedContent },
-    });
-    return { tbCorrect: false, fixedTBPath: tbPath, reason: fixReason };
+    let fixedTBPath: string | undefined;
+    for (const block of blocks) {
+      const targetPath = block.path?.startsWith('hw/')
+        ? block.path
+        : (block.path?.includes('tc_')
+            ? `hw/dv/ut/sim/tc/${block.path.split('/').pop()}`
+            : tbPath);
+      await ctx.executeAction({
+        type: 'writeFile',
+        payload: { path: targetPath, content: block.content },
+      });
+      if (targetPath === tbPath) fixedTBPath = tbPath;
+    }
+    return { tbCorrect: false, fixedTBPath: fixedTBPath ?? tbPath, reason: fixReason };
   }
 
   // Could not parse a code block — write the full response as best-effort fix
@@ -407,6 +461,10 @@ export async function fixCompileErrors(
     }
   }
 
+  // TCs are included into the TB during compile — compile errors may be
+  // in the TC file(s), so VE needs to see them.
+  const tcs = await readModuleTCs(ctx, moduleName);
+
   // Build extra context for include-path / file-not-found errors
   let extraContext: string | undefined;
   const errLower = compileErrors.toLowerCase();
@@ -453,7 +511,7 @@ export async function fixCompileErrors(
     }
   }
 
-  const messages = buildVECompileFixMessages(moduleName, compileErrors, tbCode, extraContext);
+  const messages = buildVECompileFixMessages(moduleName, compileErrors, tbCode, tcs, extraContext);
 
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
@@ -519,8 +577,11 @@ export async function auditSpecVsChecker(
   checkerCode: string,
   checkerOutput: string,
 ): Promise<SpecCheckerAuditResult> {
+  // TCs provide stimulus — auditor needs them to trace the checker's
+  // expected-value computation against the actual inputs.
+  const tcs = await readModuleTCs(ctx, moduleName);
   const messages = buildSpecCheckerAuditMessages(
-    moduleName, functionalSpec, checkerCode, checkerOutput,
+    moduleName, functionalSpec, checkerCode, checkerOutput, tcs,
   );
 
   const startMs = Date.now();
