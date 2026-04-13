@@ -818,6 +818,34 @@ function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+/** Truncate a string (possibly containing ANSI codes) to maxCols visible characters. */
+function truncateAnsi(s: string, maxCols: number): string {
+  // eslint-disable-next-line no-control-regex
+  const ansiRe = /\x1b\[[0-9;]*m/g;
+  let visLen = 0;
+  let result = '';
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ansiRe.exec(s)) !== null) {
+    const textBefore = s.slice(lastIdx, m.index);
+    const room = maxCols - visLen;
+    if (textBefore.length > room) {
+      result += textBefore.slice(0, room);
+      return result + '\x1b[0m';
+    }
+    result += textBefore + m[0];
+    visLen += textBefore.length;
+    lastIdx = m.index + m[0].length;
+  }
+  const tail = s.slice(lastIdx);
+  const room = maxCols - visLen;
+  if (tail.length > room) {
+    result += tail.slice(0, room);
+    return result + '\x1b[0m';
+  }
+  return result + tail;
+}
+
 /**
  * Dropdown command suggestions rendered below the prompt line.
  *
@@ -983,7 +1011,8 @@ class CommandSuggestions {
       if (row === visibleCount - 1 && scrollTop + visibleCount < total) indicator = chalk.dim(' ↓');
       out.write('\x1b[1B');                 // cursor down 1
       out.write('\r\x1b[2K');               // col 0 + clear entire line
-      out.write(`${prefix}${name}${args}${desc}${indicator}`);
+      const cols = process.stdout.columns || 80;
+      out.write(truncateAnsi(`${prefix}${name}${args}${desc}${indicator}`, cols - 1));
     }
 
     this.renderedCount = visibleCount;
@@ -1061,7 +1090,8 @@ function interactiveSelect(
           let indicator = '';
           if (row === 0 && scrollTop > 0) indicator = chalk.dim(' ↑');
           if (row === maxShow - 1 && scrollTop + maxShow < items.length) indicator = chalk.dim(' ↓');
-          out.write(`  ${prefix}${text}${indicator}`);
+          const cols = process.stdout.columns || 80;
+          out.write(truncateAnsi(`  ${prefix}${text}${indicator}`, cols - 1));
         }
         if (row < maxShow - 1) out.write('\n');
       }
