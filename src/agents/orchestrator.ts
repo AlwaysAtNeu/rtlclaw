@@ -1716,7 +1716,22 @@ export class Orchestrator {
     yield { type: 'status', content: summary };
 
     if (context.autoMode) {
-      yield { type: 'status', content: `Auto-mode: skipping module ${mod.name}.` };
+      // v3.1: Auto-mode invokes Infrastructure Debug as the final escalation
+      // before giving up — mirroring the compile-error escalation path (which
+      // runs infra-debug unconditionally). Without this, auto-mode would skip
+      // the module without using its last-resort tool.
+      yield { type: 'status', content: `Auto-mode: debug loop exhausted for ${mod.name} — invoking Infrastructure Debug (final escalation)...` };
+      const infraResult = yield* this.runFunctionalInfraDebug(mod, ctx, phase2, context);
+      if (infraResult.resolved) {
+        mod.debugHistory.push(`[InfraDebug resolved] ${infraResult.summary.slice(0, 200)}`);
+        yield { type: 'status', content: `Infrastructure Debug resolved ${mod.name}. Re-running simulation...` };
+        // Reset counters so the caller re-enters the debug loop with fresh state.
+        mod.sameErrorRetries = 0;
+        mod.totalIterations = 0;
+        return;
+      }
+      mod.debugHistory.push(`[InfraDebug failed] ${infraResult.summary.slice(0, 200)}`);
+      yield { type: 'status', content: `Auto-mode: Infrastructure Debug could not resolve ${mod.name} (${infraResult.summary.slice(0, 200)}). Skipping module.` };
       mod.status = 'failed';
       return;
     }
@@ -1728,25 +1743,8 @@ export class Orchestrator {
 
       if (choice === '1') {
         // v3.1: Infrastructure Debug Agent for functional errors
-        await this.logWorkflow(context, 'INFRA_DEBUG', 'start', `module=${mod.name} mode=functional`);
         yield { type: 'status', content: 'User authorized Infrastructure Debug — LLM will access both RTL and TB with spec as ground truth.' };
-
-        // Build spec context for the agent
-        const specParts: string[] = [];
-        if (phase2?.functionalSpec) specParts.push(`Functional Spec:\n${phase2.functionalSpec}`);
-        if (phase2?.utVerification) specParts.push(`Verification Requirements:\n${JSON.stringify(phase2.utVerification, null, 2)}`);
-        if (phase2?.fsmDescription) specParts.push(`FSM Description:\n${phase2.fsmDescription}`);
-        if (phase2?.timingNotes) specParts.push(`Timing Notes:\n${phase2.timingNotes}`);
-        const specStr = specParts.length > 0 ? specParts.join('\n\n') : 'No detailed spec available.';
-
-        // Get the last error for the agent
-        const lastError = mod.debugHistory.length > 0
-          ? `Module: ${mod.name}\nLast error:\n${mod.debugHistory[mod.debugHistory.length - 1]}`
-          : `Module: ${mod.name}\nDebug exhausted after ${mod.totalIterations} iterations.`;
-
-        const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, lastError, 'functional', specStr));
-
-        await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} rounds=${infraResult.toolRounds}`);
+        const infraResult = yield* this.runFunctionalInfraDebug(mod, ctx, phase2, context);
 
         if (infraResult.resolved) {
           yield { type: 'status', content: `Infrastructure Debug resolved the issue. Re-running simulation...` };
@@ -2285,6 +2283,36 @@ export class Orchestrator {
       if (done) return value;
       yield value;
     }
+  }
+
+  /**
+   * Invoke the Infrastructure Debug Agent for a functional error. Builds the
+   * spec context from phase2 and the last error from debugHistory, then runs
+   * the agent. Shared between auto-mode (final escalation) and interactive
+   * mode (user authorization). Returns the InfraDebugResult so callers can
+   * handle post-resolution state.
+   */
+  private async *runFunctionalInfraDebug(
+    mod: ModuleStatus,
+    ctx: StageContext,
+    phase2: ArchitectPhase2Output | undefined,
+    context: OrchestratorContext,
+  ): AsyncGenerator<OutputChunk, import('../stages/infra-debug.js').InfraDebugResult> {
+    const specParts: string[] = [];
+    if (phase2?.functionalSpec) specParts.push(`Functional Spec:\n${phase2.functionalSpec}`);
+    if (phase2?.utVerification) specParts.push(`Verification Requirements:\n${JSON.stringify(phase2.utVerification, null, 2)}`);
+    if (phase2?.fsmDescription) specParts.push(`FSM Description:\n${phase2.fsmDescription}`);
+    if (phase2?.timingNotes) specParts.push(`Timing Notes:\n${phase2.timingNotes}`);
+    const specStr = specParts.length > 0 ? specParts.join('\n\n') : 'No detailed spec available.';
+
+    const lastError = mod.debugHistory.length > 0
+      ? `Module: ${mod.name}\nLast error:\n${mod.debugHistory[mod.debugHistory.length - 1]}`
+      : `Module: ${mod.name}\nDebug exhausted after ${mod.totalIterations} iterations.`;
+
+    await this.logWorkflow(context, 'INFRA_DEBUG', 'start', `module=${mod.name} mode=functional`);
+    const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, lastError, 'functional', specStr));
+    await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} rounds=${infraResult.toolRounds}`);
+    return infraResult;
   }
 
   /**
