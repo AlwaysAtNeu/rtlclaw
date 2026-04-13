@@ -28,6 +28,7 @@ import {
   buildArchitectP1RevisionMessages,
 } from '../agents/context-builder.js';
 import { ARCHITECT_TOOL_SCHEMA } from '../agents/prompts.js';
+import { validatePhase1Structure } from './structural-validation.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -554,7 +555,54 @@ export async function* runArchitectPhase1(
           content: 'Architecture JSON parsed successfully despite HDL code presence.',
         };
       }
-      break; // success
+
+      // Structural validation: catches semantically-inconsistent but
+      // syntactically-valid output (e.g. interface-contract signal names that
+      // don't match module ports — the most common LLM mistake). Retries feed
+      // errors back as corrections so the LLM can fix them within the same
+      // conversation.
+      const validation = validatePhase1Structure(phase1Output);
+      if (validation.warnings.length > 0) {
+        yield {
+          type: 'progress',
+          content: `Structural warnings:\n${validation.warnings.map(w => `  ⚠ ${w}`).join('\n')}`,
+        };
+      }
+      if (!validation.valid) {
+        const errorList = validation.errors.map(e => `  - ${e}`).join('\n');
+        if (attempt < MAX_PARSE_RETRIES) {
+          yield {
+            type: 'progress',
+            content: `Structural validation failed (${validation.errors.length} errors). Retrying with correction...\n${errorList}`,
+          };
+          const cleanContent = stripHdlCodeBlocks(response.content);
+          messages = [
+            ...messages,
+            { role: 'assistant', content: cleanContent },
+            {
+              role: 'user',
+              content:
+                `Your architecture JSON parsed, but it has STRUCTURAL errors that must be fixed:\n${errorList}\n\n` +
+                `Common fixes:\n` +
+                `  1. Every interface-contract signal name must EXACTLY match a port name on BOTH the producer and each consumer. If the modules use different port names, use "signalMapping" to translate them explicitly.\n` +
+                `  2. Every name in "topModules" must appear in "modules".\n` +
+                `  3. Every instantiated sub-module must appear in "modules".\n` +
+                `  4. No duplicate module names, no cyclic instantiations.\n\n` +
+                `Re-emit the complete JSON (do NOT return a diff) with these corrections.`,
+            },
+          ];
+          phase1Output = null;
+          // fall through to next retry iteration
+        } else {
+          yield {
+            type: 'error',
+            content: `Architect Phase 1 structural validation failed after ${MAX_PARSE_RETRIES + 1} attempts:\n${errorList}`,
+          };
+          return;
+        }
+      } else {
+        break; // success — parsed AND structurally valid
+      }
     } catch (parseErr) {
       const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
       if (attempt < MAX_PARSE_RETRIES) {
@@ -644,7 +692,7 @@ export async function* runArchitectPhase1(
 
       // Build revision messages and re-run
       const prevJSON = JSON.stringify(phase1Output, null, 2);
-      const revisionMessages = buildArchitectP1RevisionMessages(prevJSON, feedback);
+      let revisionMessages = buildArchitectP1RevisionMessages(prevJSON, feedback);
 
       let revisionOutput: ArchitectPhase1Output | null = null;
       for (let attempt = 0; attempt <= MAX_PARSE_RETRIES; attempt++) {
@@ -671,7 +719,46 @@ export async function* runArchitectPhase1(
 
         try {
           revisionOutput = parsePhase1Response(response);
-          break;
+
+          // Same structural validation as the initial design path
+          const validation = validatePhase1Structure(revisionOutput);
+          if (validation.warnings.length > 0) {
+            yield {
+              type: 'progress',
+              content: `Structural warnings:\n${validation.warnings.map(w => `  ⚠ ${w}`).join('\n')}`,
+            };
+          }
+          if (!validation.valid) {
+            const errorList = validation.errors.map(e => `  - ${e}`).join('\n');
+            if (attempt < MAX_PARSE_RETRIES) {
+              yield {
+                type: 'progress',
+                content: `Revised architecture has structural errors. Retrying...\n${errorList}`,
+              };
+              const cleanContent = stripHdlCodeBlocks(response.content);
+              revisionMessages = [
+                ...revisionMessages,
+                { role: 'assistant', content: cleanContent },
+                {
+                  role: 'user',
+                  content:
+                    `Your revised architecture has structural errors:\n${errorList}\n\n` +
+                    `Fix: ensure interface-contract signal names match module port names (or use signalMapping), ` +
+                    `topModules reference declared modules, no duplicates, no cycles. Re-emit the complete JSON.`,
+                },
+              ];
+              revisionOutput = null;
+              // fall through to next retry
+            } else {
+              yield {
+                type: 'error',
+                content: `Revised architecture failed structural validation after ${MAX_PARSE_RETRIES + 1} attempts:\n${errorList}`,
+              };
+              return;
+            }
+          } else {
+            break; // success
+          }
         } catch (parseErr) {
           if (attempt >= MAX_PARSE_RETRIES) {
             yield {

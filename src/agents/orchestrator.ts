@@ -751,7 +751,11 @@ export class Orchestrator {
       if (chunk.type === 'status' && chunk.metadata?.phase1Output) {
         this.phase1Output = chunk.metadata.phase1Output as ArchitectPhase1Output;
 
-        // v3: Structural validation
+        // v3: Structural validation sanity check. architect-p1 now also runs
+        // this inside its parse-retry loop and will not emit a phase1Output if
+        // validation fails there. This block is a last-resort safety net — if
+        // something slips through, fail loud instead of proceeding with a bad
+        // design.
         await this.logWorkflow(context, 'P1', 'done', `modules=${this.phase1Output.dependencyOrder.length} contracts=${this.phase1Output.interfaceContracts?.length ?? 0}`);
         await this.logWorkflow(context, 'validation', 'start');
         const validation = validatePhase1Structure(this.phase1Output);
@@ -762,15 +766,17 @@ export class Orchestrator {
           };
         }
         if (!validation.valid) {
+          await this.logWorkflow(context, 'validation', 'fail', `errors=${validation.errors.length}`);
           yield {
             type: 'error',
-            content: `Structural validation errors:\n${validation.errors.map(e => `  - ${e}`).join('\n')}`,
+            content: `Structural validation errors (architect-p1 retries exhausted):\n${validation.errors.map(e => `  - ${e}`).join('\n')}`,
           };
-          // Feed errors back to LLM for correction (up to 2 retries handled by architect-p1)
-          // For now, continue with the design but warn the user
+          // Clear phase1Output so downstream stages don't act on a bad design.
+          this.phase1Output = null;
+          return;
         }
 
-        await this.logWorkflow(context, 'validation', validation.valid ? 'done' : 'fail', `errors=${validation.errors.length} warnings=${validation.warnings.length}`);
+        await this.logWorkflow(context, 'validation', 'done', `errors=0 warnings=${validation.warnings.length}`);
 
         this.designIndex = convertToDesignIndex(this.phase1Output);
         context.designIndex = this.designIndex;
