@@ -20,7 +20,9 @@ import { execAsync, assertSafePath } from '../utils/exec.js';
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_TOOL_ROUNDS = 8;
+const MAX_ACTION_ROUNDS = 8;
+const MAX_TOTAL_ROUNDS = 32;
+const ACTION_TOOLS = new Set(['write_file', 'run_command']);
 
 // ---------------------------------------------------------------------------
 // Tool schemas (subset of ClawMode tools)
@@ -138,8 +140,10 @@ export interface InfraDebugResult {
   summary: string;
   /** Files that were modified */
   modifiedFiles: string[];
-  /** Number of tool rounds used */
+  /** Number of LLM turns that invoked tools (read + action) */
   toolRounds: number;
+  /** Number of LLM turns that invoked write_file / run_command */
+  actionRounds: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,10 +228,11 @@ export async function* runInfraDebug(
   let fullContent = '';
   const modifiedFiles: string[] = [];
   let toolRounds = 0;
+  let actionRounds = 0;
 
-  yield { type: 'status', content: `Infrastructure Debug Agent started (${mode} mode, max ${MAX_TOOL_ROUNDS} rounds)` };
+  yield { type: 'status', content: `Infrastructure Debug Agent started (${mode} mode, action≤${MAX_ACTION_ROUNDS} total≤${MAX_TOTAL_ROUNDS})` };
 
-  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+  for (let round = 0; round < MAX_TOTAL_ROUNDS; round++) {
     const startMs = Date.now();
     let response;
 
@@ -242,7 +247,7 @@ export async function* runInfraDebug(
       const msg = err instanceof Error ? err.message : String(err);
       if (/tools?\s*(is\s+)?not\s+support|unsupported.*tool/i.test(msg)) {
         yield { type: 'error', content: 'LLM provider does not support tool calling — infrastructure debug requires it.' };
-        return { resolved: false, summary: 'Provider does not support tool calling', modifiedFiles: [], toolRounds: 0 };
+        return { resolved: false, summary: 'Provider does not support tool calling', modifiedFiles: [], toolRounds: 0, actionRounds: 0 };
       }
       throw err;
     }
@@ -261,7 +266,7 @@ export async function* runInfraDebug(
         responseChars: response.content.length,
         hasCodeBlock: false,
         retryCount: response.retryCount,
-        summary: `round ${round}/${MAX_TOOL_ROUNDS}, ${response.toolCalls.length} tool calls`,
+        summary: `round ${round + 1}/${MAX_TOTAL_ROUNDS} (action ${actionRounds}/${MAX_ACTION_ROUNDS}), ${response.toolCalls.length} tool calls`,
         promptContent: messages,
         responseContent: response.content,
       });
@@ -276,6 +281,8 @@ export async function* runInfraDebug(
     // Process tool calls
     if (response.toolCalls && response.toolCalls.length > 0) {
       toolRounds++;
+      const hasAction = response.toolCalls.some(tc => ACTION_TOOLS.has(tc.name));
+      if (hasAction) actionRounds++;
       messages.push({
         role: 'assistant',
         content: response.content || '',
@@ -306,24 +313,48 @@ export async function* runInfraDebug(
       }
 
       // If all tools failed repeatedly, ask LLM to wrap up
-      if (toolErrors === response.toolCalls.length && round >= 3) {
+      if (toolErrors === response.toolCalls.length && toolRounds >= 3) {
         messages.push({
           role: 'user',
           content: 'Multiple tool calls have failed. Summarize what you found so far. Start with "RESOLVED:" or "UNRESOLVED:".',
         });
       }
 
-      // Force summary on last round
-      if (round >= MAX_TOOL_ROUNDS) {
+      // Force summary when either budget is exhausted
+      const actionHit = actionRounds >= MAX_ACTION_ROUNDS;
+      const totalHit = toolRounds >= MAX_TOTAL_ROUNDS;
+      if (actionHit || totalHit) {
+        const reason = actionHit
+          ? `Action round cap reached (${MAX_ACTION_ROUNDS} write/run turns used)`
+          : `Total round cap reached (${MAX_TOTAL_ROUNDS} tool turns used)`;
         messages.push({
           role: 'user',
-          content: 'Tool call limit reached. Provide your final summary. Start with "RESOLVED:" or "UNRESOLVED:".',
+          content: `${reason}. Provide your final summary. Start with "RESOLVED:" or "UNRESOLVED:".`,
         });
+        const finalStart = Date.now();
         const finalResp = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
+        const finalDuration = Date.now() - finalStart;
+        if (ctx.logTrace) {
+          await ctx.logTrace({
+            timestamp: new Date().toISOString(),
+            role: 'InfraDebug',
+            promptTokens: finalResp.usage.promptTokens,
+            completionTokens: finalResp.usage.completionTokens,
+            durationMs: finalDuration,
+            taskContext: `infra-debug:${mode}:final-summary`,
+            responseChars: finalResp.content.length,
+            hasCodeBlock: false,
+            retryCount: finalResp.retryCount,
+            summary: `forced summary (${reason})`,
+            promptContent: messages,
+            responseContent: finalResp.content,
+          });
+        }
         if (finalResp.content) {
           fullContent += finalResp.content;
           yield { type: 'text', content: finalResp.content };
         }
+        break;
       }
 
       continue; // Next round
@@ -338,12 +369,13 @@ export async function* runInfraDebug(
   const summaryMatch = fullContent.match(/(?:RESOLVED|UNRESOLVED):\s*([\s\S]*?)$/);
   const summary = summaryMatch ? summaryMatch[1].trim().slice(0, 500) : fullContent.slice(-300).trim();
 
-  yield { type: 'status', content: `Infrastructure Debug Agent finished: ${resolved ? 'RESOLVED' : 'UNRESOLVED'} (${toolRounds} tool rounds)` };
+  yield { type: 'status', content: `Infrastructure Debug Agent finished: ${resolved ? 'RESOLVED' : 'UNRESOLVED'} (${toolRounds} total, ${actionRounds} action)` };
 
   return {
     resolved,
     summary,
     modifiedFiles,
     toolRounds,
+    actionRounds,
   };
 }

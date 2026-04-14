@@ -2098,7 +2098,20 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
   }
 
   (rl as any)._ttyWrite = function (s: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean; sequence?: string }) {
-    if (busy || rlClosed) {
+    if (busy) {
+      // While a task is running readline is paused but its keypress listener
+      // is still live. If we delegate to origTtyWrite, a plain key (e.g. space)
+      // gets inserted into rl.line and triggers _refreshLine() — which paints
+      // the prompt on top of the spinner and makes the UI look like the task
+      // crashed. Swallow everything except Ctrl+C, which still needs to reach
+      // readline so it can emit 'SIGINT' and our handler can abort the task.
+      // Esc is handled separately via the raw stdin listener above.
+      if (key?.ctrl && key?.name === 'c') {
+        return origTtyWrite.call(this, s, key);
+      }
+      return;
+    }
+    if (rlClosed) {
       return origTtyWrite.call(this, s, key);
     }
 

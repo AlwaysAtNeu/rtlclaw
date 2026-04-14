@@ -2317,7 +2317,7 @@ export class Orchestrator {
 
     await this.logWorkflow(context, 'INFRA_DEBUG', 'start', `module=${mod.name} mode=functional`);
     const infraResult = yield* this.drainInfraDebug(runInfraDebug(ctx, lastError, 'functional', specStr));
-    await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} rounds=${infraResult.toolRounds}`);
+    await this.logWorkflow(context, 'INFRA_DEBUG', 'done', `module=${mod.name} resolved=${infraResult.resolved} total=${infraResult.toolRounds} action=${infraResult.actionRounds}`);
     return infraResult;
   }
 

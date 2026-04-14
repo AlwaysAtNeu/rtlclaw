@@ -28,6 +28,9 @@ export function execAsync(cmd: string, opts: ExecAsyncOptions = {}): Promise<str
       cwd: opts.cwd ?? process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: opts.shell,
+      // New process group so timeout/abort can reap the whole tree
+      // (shell + descendants) via process.kill(-pid, …).
+      detached: true,
     });
 
     const stdoutChunks: string[] = [];
@@ -35,38 +38,56 @@ export function execAsync(cmd: string, opts: ExecAsyncOptions = {}): Promise<str
     child.stdout.on('data', (d: Buffer) => stdoutChunks.push(d.toString()));
     child.stderr.on('data', (d: Buffer) => stderrChunks.push(d.toString()));
 
-    // Timeout
     let timedOut = false;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let killHandle:    ReturnType<typeof setTimeout> | undefined;
+
+    const killGroup = (sig: NodeJS.Signals): void => {
+      try {
+        if (typeof child.pid === 'number') process.kill(-child.pid, sig);
+        else child.kill(sig);
+      } catch { /* ESRCH: group already gone */ }
+    };
+
+    const scheduleEscalation = (): void => {
+      if (killHandle) return;          // already escalating
+      killGroup('SIGTERM');
+      killHandle = setTimeout(() => {
+        killGroup('SIGKILL');
+        try { child.stdout?.destroy(); } catch { /* */ }
+        try { child.stderr?.destroy(); } catch { /* */ }
+      }, 3000);
+    };
+
     if (opts.timeout && opts.timeout > 0) {
       timeoutHandle = setTimeout(() => {
         timedOut = true;
-        child.kill('SIGTERM');
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 3000);
+        scheduleEscalation();
       }, opts.timeout);
     }
 
-    // Abort signal
+    let onAbort: (() => void) | undefined;
     if (opts.signal) {
-      const onAbort = () => {
-        child.kill('SIGTERM');
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000);
-      };
+      onAbort = () => scheduleEscalation();
       opts.signal.addEventListener('abort', onAbort, { once: true });
-      child.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
     }
 
-    child.on('error', (err) => {
+    const cleanup = (): void => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (killHandle)    clearTimeout(killHandle);
+      if (opts.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
+    };
+
+    child.on('error', (err) => {
+      cleanup();
       reject(err);
     });
 
     child.on('close', (code) => {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
+      cleanup();
       const stdout = stdoutChunks.join('');
       const stderr = stderrChunks.join('');
 
-      // Check if aborted
       if (opts.signal?.aborted) {
         reject(new DOMException('The operation was aborted.', 'AbortError'));
         return;
