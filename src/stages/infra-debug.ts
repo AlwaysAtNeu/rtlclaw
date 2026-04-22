@@ -153,9 +153,15 @@ export interface InfraDebugResult {
 function buildCompileDebugPrompt(): string {
   return `You are an Infrastructure Debug Agent for an RTL (chip design) project.
 
-A compilation error has occurred that the specific-role agents (RTL Designer, Verification Engineer) could not fix after multiple attempts. Your job is to investigate the root cause and fix it.
+A compilation error has occurred that the specific-role agents (RTL Designer, Verification Engineer) could not fix after multiple attempts. Your job is to investigate the root cause AND APPLY THE FIX.
 
 You have access to tools: list_files, read_file, write_file, run_command.
+
+CONFIDENT FIX → APPLY IT YOURSELF. NOT CONFIDENT → STOP AND REPORT UNRESOLVED.
+- If you have identified the root cause and know the correct fix: call write_file to apply it, then run_command to verify.
+- If you cannot find the root cause, are guessing, or the issue is outside your scope (env/permissions/user config): output UNRESOLVED with what you found. Do NOT make speculative edits.
+- Forbidden: "you should change X to Y", "the fix would be to...", "I recommend updating..." — if you know the fix, apply it; if you don't, say UNRESOLVED.
+- Equally forbidden: writing a placebo edit just to satisfy the RESOLVED requirement. A wrong fix is worse than UNRESOLVED.
 
 Common root causes:
 - Filelist (.f file) has invalid entries, wrong paths, or missing files
@@ -168,17 +174,21 @@ Common root causes:
 Approach:
 1. Read the error message carefully
 2. Use list_files and read_file to investigate the project structure
-3. Identify the root cause
-4. Fix the issue (write_file to correct files, or note what needs changing)
-5. Run the compilation/simulation again to verify your fix
+3. Try to identify the root cause
+4. If confident in the fix → call write_file to apply it, then run_command to verify
+5. If verification fails → iterate (re-read, re-fix, re-run)
+6. If you cannot find the root cause after investigation → stop and output UNRESOLVED
 
-When done, output a summary starting with "RESOLVED:" or "UNRESOLVED:" followed by what you found and did.`;
+Output a summary starting with "RESOLVED:" or "UNRESOLVED:".
+- RESOLVED requires: you actually applied a fix (write_file or a configuration-changing run_command) AND a follow-up run_command shows the original error is gone.
+- If you only investigated, only described a fix, or are unsure → output UNRESOLVED. The user will take over.
+- A transient error that disappears on a clean re-run also counts: a single run_command that shows the error is gone (with your explanation) is acceptable as RESOLVED.`;
 }
 
 function buildFunctionalDebugPrompt(spec: string): string {
   return `You are an Infrastructure Debug Agent for an RTL (chip design) project.
 
-The normal debug loop (RTL Designer fixing RTL, VE fixing testbench) has been exhausted without resolving the issue. The user has authorized you to investigate with full access to both RTL and testbench code.
+The normal debug loop (RTL Designer fixing RTL, VE fixing testbench) has been exhausted without resolving the issue. The user has authorized you to investigate with full access to both RTL and testbench code AND TO APPLY THE FIX YOURSELF.
 
 CRITICAL RULE: The design specification below is the IMMUTABLE GROUND TRUTH.
 - If RTL behavior doesn't match the spec → fix the RTL
@@ -191,15 +201,24 @@ ${spec}
 
 You have access to tools: list_files, read_file, write_file, run_command.
 
+CONFIDENT FIX → APPLY IT YOURSELF. NOT CONFIDENT → STOP AND REPORT UNRESOLVED.
+- If you can pinpoint exactly which side (RTL or TB) deviates from spec and know the correct fix: call write_file to apply it, then run_command to re-simulate.
+- If you cannot decide which side is wrong, or are guessing: output UNRESOLVED with what you found. The user will take over.
+- Forbidden: "the RTL should be changed to...", "I recommend updating the checker...", "the fix would be..." — if you know the fix, apply it; if you don't, say UNRESOLVED.
+- Equally forbidden: writing a placebo edit just to satisfy the RESOLVED requirement. A wrong fix corrupts a working side and is worse than UNRESOLVED.
+
 Approach:
 1. Read the error output and understand what signal/value/time is failing
 2. Read the RTL code — check if it implements the spec correctly
 3. Read the TB/TC code — check if checkers match the spec expectations
-4. Identify which side (RTL or TB) deviates from spec
-5. Fix the deviating code
-6. Run simulation to verify
+4. Decide which side (RTL or TB) deviates from spec — only proceed if you are confident
+5. If confident → call write_file to apply the fix, then run_command to re-simulate
+6. If still failing → iterate (re-read, re-fix, re-run)
+7. If you cannot confidently identify the bad side → stop and output UNRESOLVED
 
-When done, output a summary starting with "RESOLVED:" or "UNRESOLVED:" followed by what you found and did.`;
+Output a summary starting with "RESOLVED:" or "UNRESOLVED:".
+- RESOLVED requires: you actually called write_file AND a follow-up run_command shows the failure is gone.
+- If you only investigated, only described a fix, or are unsure which side is wrong → output UNRESOLVED.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,9 +384,19 @@ export async function* runInfraDebug(
   }
 
   // Parse result from LLM's summary
-  const resolved = fullContent.includes('RESOLVED:') && !fullContent.includes('UNRESOLVED:');
+  const claimedResolved = fullContent.includes('RESOLVED:') && !fullContent.includes('UNRESOLVED:');
   const summaryMatch = fullContent.match(/(?:RESOLVED|UNRESOLVED):\s*([\s\S]*?)$/);
-  const summary = summaryMatch ? summaryMatch[1].trim().slice(0, 500) : fullContent.slice(-300).trim();
+  let summary = summaryMatch ? summaryMatch[1].trim().slice(0, 500) : fullContent.slice(-300).trim();
+
+  // Guardrail: claiming RESOLVED without ever calling write_file/run_command means
+  // the agent only described a fix instead of applying it. Downgrade to UNRESOLVED.
+  let resolved = claimedResolved;
+  if (claimedResolved && actionRounds === 0) {
+    resolved = false;
+    const note = 'Agent claimed RESOLVED but never called write_file/run_command — fix was only described, not applied. Downgraded to UNRESOLVED.';
+    yield { type: 'error', content: note };
+    summary = `${note}\nOriginal summary: ${summary}`.slice(0, 500);
+  }
 
   yield { type: 'status', content: `Infrastructure Debug Agent finished: ${resolved ? 'RESOLVED' : 'UNRESOLVED'} (${toolRounds} total, ${actionRounds} action)` };
 
