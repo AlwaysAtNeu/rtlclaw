@@ -17,20 +17,18 @@ import type {
 import type { StageContext, OutputChunk } from './types.js';
 
 /**
- * Generate a top-level module for the given top module name.
+ * Pure content builder for the top module — no I/O, no yields.
+ * Used by generateTopModule (writes to disk) and by the ST triage drift check
+ * (compares canonical content against disk before deciding to re-run).
  */
-export async function* generateTopModule(
-  ctx: StageContext,
+export function buildTopModuleContent(
   phase1: ArchitectPhase1Output,
   topModuleName: string,
   hdlStandard?: string,
-): AsyncGenerator<OutputChunk> {
-  yield { type: 'progress', content: `Generating top module "${topModuleName}"...` };
-
+): { content: string; filePath: string } | { error: string } {
   const topMod = phase1.modules.find(m => m.name === topModuleName);
   if (!topMod) {
-    yield { type: 'error', content: `Top module "${topModuleName}" not found in architecture.` };
-    return;
+    return { error: `Top module "${topModuleName}" not found in architecture.` };
   }
 
   const isSV = hdlStandard?.startsWith('sv');
@@ -97,6 +95,26 @@ export async function* generateTopModule(
 
   const filePath = `hw/src/hdl/${topModuleName}${ext}`;
   const content = lines.join('\n');
+  return { content, filePath };
+}
+
+/**
+ * Generate a top-level module for the given top module name.
+ */
+export async function* generateTopModule(
+  ctx: StageContext,
+  phase1: ArchitectPhase1Output,
+  topModuleName: string,
+  hdlStandard?: string,
+): AsyncGenerator<OutputChunk> {
+  yield { type: 'progress', content: `Generating top module "${topModuleName}"...` };
+
+  const result = buildTopModuleContent(phase1, topModuleName, hdlStandard);
+  if ('error' in result) {
+    yield { type: 'error', content: result.error };
+    return;
+  }
+  const { content, filePath } = result;
 
   await ctx.executeAction({
     type: 'writeFile',

@@ -17,8 +17,12 @@ import type {
   ArchitectPhase1Output,
   ArchitectPhase2Output,
   ArchitectModuleBrief,
+  DesignRationale,
   InterfaceContract,
+  AttemptRecord,
+  FailureReport,
 } from './types.js';
+import { formatAttemptHistoryForPrompt } from '../utils/attempt-record.js';
 import {
   INTENT_CLASSIFICATION_PROMPT,
   ARCHITECT_REQUIREMENTS_PROMPT,
@@ -33,6 +37,8 @@ import {
   ST_TRIAGE_PROMPT,
   VE_COMPILE_FIX_PROMPT,
   SPEC_CHECKER_AUDIT_PROMPT,
+  SELF_DIAGNOSE_PROMPT,
+  ARCHITECT_P2_REVISION_PROMPT,
   getHdlSyntaxRules,
 } from './prompts.js';
 
@@ -84,6 +90,21 @@ export function getRelevantContracts(
   return contracts.filter(
     c => c.producer === moduleName || c.consumers.includes(moduleName),
   );
+}
+
+/**
+ * v3.2: Render the Architect's cross-cutting rationale as a short prompt
+ * block. Returns '' if no rationale fields are populated, so callers can
+ * concatenate unconditionally without leaking empty headers.
+ */
+export function formatDesignRationale(dr: DesignRationale | undefined): string {
+  if (!dr) return '';
+  const parts: string[] = [];
+  if (dr.handshake) parts.push(`- Handshake: ${dr.handshake}`);
+  if (dr.clockDomains) parts.push(`- Clocking: ${dr.clockDomains}`);
+  if (dr.resetStrategy) parts.push(`- Reset: ${dr.resetStrategy}`);
+  if (parts.length === 0) return '';
+  return `Architect rationale (cross-cutting choices to honor):\n${parts.join('\n')}`;
 }
 
 function formatDesignIndexBrief(index: DesignIndex): string {
@@ -168,13 +189,86 @@ export function buildArchitectP2Messages(
     }
   }
 
+  // v3.2: Carry Architect's cross-cutting rationale into P2
+  const rationaleBlock = formatDesignRationale(phase1Output.designRationale);
+  const rationaleSection = rationaleBlock ? `\n\n${rationaleBlock}` : '';
+
   return [
     { role: 'system', content: ARCHITECT_P2_PROMPT },
     {
       role: 'user',
-      content: `Global architecture:\n${globalSummary}\n\nTop modules: ${phase1Output.topModules.join(', ')}\nDependency order: ${phase1Output.dependencyOrder.join(' -> ')}\n\nProvide detailed design for:\n${modDetail}${contractsSection}`,
+      content: `Global architecture:\n${globalSummary}\n\nTop modules: ${phase1Output.topModules.join(', ')}\nDependency order: ${phase1Output.dependencyOrder.join(' -> ')}\n\nProvide detailed design for:\n${modDetail}${contractsSection}${rationaleSection}`,
     },
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Architect Phase 2 Revision (Phase 2b — cross-stage failure feedback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build messages for the P2 revision call. Carries:
+ *  - the previous P2 spec (JSON-stringified)
+ *  - all past revisions for this module, each with the formatted attempt
+ *    snapshot showing what was tried under that revision
+ *  - the current FailureReport's attemptHistorySnapshot (under the most
+ *    recent revision)
+ *  - the optional rootCauseHypothesis from selfDiagnose (Phase 2a output)
+ *
+ * The pastRevisions section is the key part: it stops the architect from
+ * proposing an equivalent of a prior revision by showing what failed under
+ * each one, with the same negative-example framing used elsewhere.
+ */
+export function buildArchitectP2RevisionMessages(
+  prevP2JSON: string,
+  failure: FailureReport,
+): Message[] {
+  const sections: string[] = [];
+
+  sections.push(`Previous module specification (your most recent version for "${failure.module}"):
+\`\`\`json
+${prevP2JSON}
+\`\`\``);
+
+  if (failure.pastRevisions.length > 0) {
+    sections.push('Past revisions you have already issued for this module — DO NOT propose anything equivalent to these:');
+    failure.pastRevisions.forEach((rev, i) => {
+      const diagBlock = rev.diagnosisSnapshot
+        ? `\n  Root-cause hypothesis at that time: ${rev.diagnosisSnapshot}`
+        : '';
+      const declaredBlock = rev.declaredReason
+        ? `\n  Declared reason at that time (revision-not-helpful was used): ${rev.declaredReason}`
+        : '';
+      const outcomeStr = rev.outcome ?? 'in-progress';
+      sections.push(`Revision #${i + 1} (target=${rev.target}, applied ${rev.appliedAt}, outcome=${outcomeStr}):${diagBlock}${declaredBlock}
+  Attempts that ran under that revision:
+${indentBlock(rev.attemptHistorySnapshot, '    ')}`);
+    });
+    sections.push('Note: if a hypothesis recurred across multiple past revisions, the issue is likely structural (P1-level) rather than spec-level — that is a strong signal to declare revisionNotHelpful with that reason.');
+  }
+
+  sections.push(`Failure context for this revision request:
+  Reporting stage: ${failure.reportingStage}
+  Pattern detected: ${failure.patternKind}
+
+  Attempts under your most recent spec:
+${indentBlock(failure.attemptHistorySnapshot, '  ')}`);
+
+  if (failure.rootCauseHypothesis) {
+    sections.push(`Root-cause hypothesis from upstream diagnosis (current):
+  ${failure.rootCauseHypothesis}`);
+  }
+
+  sections.push(`Issue a revised P2 specification (or signal revisionNotHelpful if the issue is structural). Output JSON only.`);
+
+  return [
+    { role: 'system', content: ARCHITECT_P2_REVISION_PROMPT },
+    { role: 'user', content: sections.join('\n\n') },
+  ];
+}
+
+function indentBlock(block: string, prefix: string): string {
+  return block.split('\n').map(l => `${prefix}${l}`).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +280,8 @@ export function buildRTLWriteMessages(
   dependentModulePorts: Array<{ name: string; ports: PortDef[] }>,
   hdlStandard?: string,
   interfaceContracts?: InterfaceContract[],
-  previousLintError?: string,
+  attemptHistory?: AttemptRecord[],
+  designRationale?: DesignRationale,
 ): Message[] {
   let prompt = RTL_DESIGNER_PROMPT;
   if (hdlStandard) {
@@ -220,9 +315,15 @@ ${phase2Design.functionalSpec}`;
     userContent += `\n\nInterface contracts (define protocol/timing for this module's connections):\n${formatInterfaceContracts(interfaceContracts)}`;
   }
 
-  // Previous lint error context (for fresh rewrite after lint failures)
-  if (previousLintError) {
-    userContent += `\n\nIMPORTANT: A previous attempt to write this module failed lint with the following error. Avoid this issue:\n${previousLintError.slice(0, 1000)}`;
+  // v3.2: Architect rationale (so Designer honors handshake/clocking/reset intent)
+  const rationaleBlock = formatDesignRationale(designRationale);
+  if (rationaleBlock) {
+    userContent += `\n\n${rationaleBlock}`;
+  }
+
+  // v4: Negative-example framing of past attempts
+  if (attemptHistory && attemptHistory.length > 0) {
+    userContent += `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`;
   }
 
   return [
@@ -240,17 +341,14 @@ export function buildRTLLintFixMessages(
   lintOutput: string,
   rtlCode: string,
   hdlStandard?: string,
+  attemptHistory?: AttemptRecord[],
 ): Message[] {
   let prompt = RTL_DESIGNER_PROMPT;
   if (hdlStandard) {
     prompt += `\n\n${getHdlSyntaxRules(hdlStandard)}`;
   }
 
-  return [
-    { role: 'system', content: prompt },
-    {
-      role: 'user',
-      content: `Fix lint errors in module "${moduleName}".
+  let content = `Fix lint errors in module "${moduleName}".
 
 Lint output:
 ${lintOutput}
@@ -258,10 +356,17 @@ ${lintOutput}
 Current RTL code:
 \`\`\`
 ${rtlCode}
-\`\`\`
+\`\`\``;
 
-Provide the complete corrected file.`,
-    },
+  if (attemptHistory && attemptHistory.length > 0) {
+    content += `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`;
+  }
+
+  content += `\n\nProvide the complete corrected file.`;
+
+  return [
+    { role: 'system', content: prompt },
+    { role: 'user', content },
   ];
 }
 
@@ -274,8 +379,9 @@ export function buildRTLDebugFixMessages(
   checkerOutput: string,
   rtlCode: string,
   funcDescription: string,
-  debugHistory?: string[],
+  attemptHistory?: AttemptRecord[],
   vcdData?: string,
+  designRationale?: DesignRationale,
 ): Message[] {
   let userContent = `Module "${moduleName}" failed unit test.
 
@@ -289,12 +395,21 @@ ${checkerOutput}`;
 
   userContent += `\n\nModule functional description:\n${funcDescription}`;
 
-  // v3: Include debug history so Designer doesn't repeat fixes
-  if (debugHistory?.length) {
-    userContent += `\n\nPrevious fix attempts:\n${debugHistory.map((h, i) => `  ${i + 1}. ${h}`).join('\n')}`;
+  // v3.2: Architect rationale — placed near the spec so debug fixes don't
+  // accidentally undo cross-cutting choices (e.g. "switch to fanout because
+  // simpler" when handshake mandates valid/ready for backpressure).
+  const rationaleBlock = formatDesignRationale(designRationale);
+  if (rationaleBlock) {
+    userContent += `\n\n${rationaleBlock}`;
   }
 
   userContent += `\n\nCurrent RTL code:\n\`\`\`\n${rtlCode}\n\`\`\``;
+
+  // v4: Negative-example framing of past attempts (placed at end, immediately
+  // before the LLM responds, so the "DO NOT repeat" framing is fresh).
+  if (attemptHistory && attemptHistory.length > 0) {
+    userContent += `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`;
+  }
 
   return [
     { role: 'system', content: RTL_DESIGNER_DEBUG_PROMPT },
@@ -312,8 +427,9 @@ export function buildRTLDebugWithVerifReqMessages(
   rtlCode: string,
   funcDescription: string,
   verificationReqs: string,
-  debugHistory?: string[],
+  attemptHistory?: AttemptRecord[],
   vcdData?: string,
+  designRationale?: DesignRationale,
 ): Message[] {
   let userContent = `Module "${moduleName}" failed unit test.
 
@@ -330,14 +446,21 @@ ${checkerOutput}`;
 Verification requirements (from Architect):
 ${verificationReqs}`;
 
-  // v3: Include debug history so Designer doesn't repeat fixes
-  if (debugHistory?.length) {
-    userContent += `\n\nPrevious fix attempts:\n${debugHistory.map((h, i) => `  ${i + 1}. ${h}`).join('\n')}`;
+  // v3.2: Architect rationale — placed before the RTL so it's part of the
+  // spec context the Designer reasons against, not after the code.
+  const rationaleBlock = formatDesignRationale(designRationale);
+  if (rationaleBlock) {
+    userContent += `\n\n${rationaleBlock}`;
   }
 
   userContent += `\n\nCurrent RTL code:\n\`\`\`\n${rtlCode}\n\`\`\`
 
 If the checker expectations don't match the verification requirements, you may flag tb_suspect.`;
+
+  // v4: Negative-example framing of past attempts at end of user message
+  if (attemptHistory && attemptHistory.length > 0) {
+    userContent += `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`;
+  }
 
   return [
     { role: 'system', content: RTL_DESIGNER_DEBUG_PROMPT },
@@ -524,6 +647,7 @@ export function buildVECompileFixMessages(
   tbCode: string,
   tcs: Array<{ path: string; content: string }>,
   extraContext?: string,
+  attemptHistory?: AttemptRecord[],
 ): Message[] {
   const tcSection = tcs.length > 0
     ? `\n\nTest case file(s) — included into the TB during compile; errors may be in a TC:\n${tcs
@@ -543,6 +667,11 @@ ${tbCode}
 
   if (extraContext) {
     content += `\n\n${extraContext}`;
+  }
+
+  // v4: Negative-example framing of past attempts
+  if (attemptHistory && attemptHistory.length > 0) {
+    content += `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`;
   }
 
   return [
@@ -584,6 +713,43 @@ ${checkerCode}
 
 Checker failure output:
 ${checkerOutput}`,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Self-diagnosis: pre-infra-debug root cause hypothesis (Phase 2a)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build messages for the gated self-diagnosis call. The diagnostic agent
+ * receives the module's spec, the most recent error, and the full attempt
+ * history rendered with the same negative-example framing the retry
+ * prompts use, so it sees what's been tried and where it failed.
+ */
+export function buildSelfDiagnosisMessages(
+  moduleName: string,
+  spec: string,
+  recentError: string,
+  attemptHistory: AttemptRecord[],
+): Message[] {
+  const historyBlock = attemptHistory.length > 0
+    ? `\n\n${formatAttemptHistoryForPrompt(attemptHistory)}`
+    : '\n\n(No structured attempt history available.)';
+
+  return [
+    { role: 'system', content: SELF_DIAGNOSE_PROMPT },
+    {
+      role: 'user',
+      content: `Module under diagnosis: ${moduleName}
+
+Module specification:
+${spec}
+
+Most recent error encountered:
+${recentError.slice(0, 2000)}${historyBlock}
+
+Form a hypothesis about the root cause. Output JSON only.`,
     },
   ];
 }

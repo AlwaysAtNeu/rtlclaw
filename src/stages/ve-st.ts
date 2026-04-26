@@ -7,9 +7,14 @@
  */
 
 import type { PortDef, InterfaceContract } from '../agents/types.js';
+import type { Message } from '../llm/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 import { buildVESystemTBMessages } from '../agents/context-builder.js';
 import { parseLLMCodeBlocks } from './ve-ut.js';
+
+function promptChars(msgs: Message[]): number {
+  return msgs.reduce((sum, m) => sum + m.content.length, 0);
+}
 
 // ---------------------------------------------------------------------------
 // Generate ST testbench + test cases
@@ -48,18 +53,28 @@ export async function* generateSTTestbench(
   const response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
   const durationMs = Date.now() - startMs;
 
+  const blocks = parseLLMCodeBlocks(response.content);
+
   if (ctx.logTrace) {
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'VerificationEngineer',
+      module: topModuleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
       taskContext: `ve-st:generate:${topModuleName}`,
+      promptChars: promptChars(messages),
+      responseChars: response.content.length,
+      hasCodeBlock: blocks.length > 0,
+      retryCount: response.retryCount,
+      summary: blocks.length > 0
+        ? `generated ${blocks.length} ST file(s) for ${topModuleName}`
+        : `no code blocks in VE-ST response for ${topModuleName}`,
+      promptContent: messages,
+      responseContent: response.content,
     });
   }
-
-  const blocks = parseLLMCodeBlocks(response.content);
 
   if (blocks.length === 0) {
     yield {

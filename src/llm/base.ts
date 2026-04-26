@@ -15,6 +15,18 @@ export interface LLMBackendOptions {
 export const TRANSIENT_PATTERN =
   /terminated|timed?\s*out|ECONNRESET|ETIMEDOUT|socket hang up|overloaded|499|5\d\d|Connection error|ENOTFOUND|EAI_AGAIN|fetch failed/i;
 
+/**
+ * Models that fix temperature internally (reasoning / thinking models).
+ * Sending a non-default temperature causes 400 errors on these models.
+ */
+const FIXED_TEMPERATURE_PATTERN =
+  /\bo[34]-?\w*|reasoner|thinking|^kimi-k2/i;
+
+/** Returns true if the model does not support user-specified temperature. */
+export function isFixedTemperatureModel(model: string): boolean {
+  return FIXED_TEMPERATURE_PATTERN.test(model);
+}
+
 export abstract class LLMBackend {
   protected model: string;
   protected apiKey?: string;

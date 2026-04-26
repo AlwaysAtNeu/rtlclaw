@@ -231,17 +231,30 @@ Output a summary starting with "RESOLVED:" or "UNRESOLVED:".
  */
 export async function* runInfraDebug(
   ctx: StageContext,
+  moduleName: string,
   errorOutput: string,
   mode: 'compile' | 'functional',
   spec?: string,
+  /**
+   * v4: Pattern-classification hint from upstream oscillation detection.
+   * When the orchestrator escalates due to repeating or alternating
+   * fingerprints, it passes a prompt-ready string here so this agent
+   * doesn't blindly inherit the surface error and try yet another
+   * tactical fix — it sees *why* it was escalated.
+   */
+  oscillationHint?: string,
 ): AsyncGenerator<OutputChunk, InfraDebugResult> {
   const systemPrompt = mode === 'compile'
     ? buildCompileDebugPrompt()
     : buildFunctionalDebugPrompt(spec ?? 'No spec available.');
 
+  const userPrefix = oscillationHint
+    ? `Escalation context (from upstream pattern detection):\n${oscillationHint}\n\n`
+    : '';
+
   const messages: Message[] = [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: `The following error needs to be investigated and fixed:\n\n${errorOutput}` },
+    { role: 'user', content: `${userPrefix}The following error needs to be investigated and fixed:\n\n${errorOutput}` },
   ];
 
   let fullContent = '';
@@ -278,6 +291,7 @@ export async function* runInfraDebug(
       await ctx.logTrace({
         timestamp: new Date().toISOString(),
         role: 'InfraDebug',
+        module: moduleName,
         promptTokens: response.usage.promptTokens,
         completionTokens: response.usage.completionTokens,
         durationMs,
@@ -357,6 +371,7 @@ export async function* runInfraDebug(
           await ctx.logTrace({
             timestamp: new Date().toISOString(),
             role: 'InfraDebug',
+            module: moduleName,
             promptTokens: finalResp.usage.promptTokens,
             completionTokens: finalResp.usage.completionTokens,
             durationMs: finalDuration,

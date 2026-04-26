@@ -3,7 +3,7 @@
  */
 
 import OpenAI from 'openai';
-import { LLMBackend, TRANSIENT_PATTERN, type LLMBackendOptions } from './base.js';
+import { LLMBackend, TRANSIENT_PATTERN, isFixedTemperatureModel, type LLMBackendOptions } from './base.js';
 import { getMaxOutputTokens } from './factory.js';
 import { createH2Fetch } from './h2-fetch.js';
 import type { LLMResponse, Message, StreamChunk, ToolCall, ToolSchema, LLMCompleteOptions } from './types.js';
@@ -89,10 +89,11 @@ export class OpenAIBackend extends LLMBackend {
     // network middleboxes (NAT, proxy, firewall) to drop the connection
     // after their idle timeout (often 30–120 s).  Streaming sends chunks
     // continuously, preventing idle-connection drops.
+    const fixedTemp = isFixedTemperatureModel(this.model);
     const params: OpenAI.ChatCompletionCreateParamsStreaming = {
       model: this.model,
       messages: this.convertMessages(messages),
-      temperature: options?.temperature ?? 0.2,
+      ...(fixedTemp ? {} : { temperature: options?.temperature ?? 0.2 }),
       ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
       stream: true,
       ...(['openai', 'deepseek'].includes(this.providerName)
@@ -221,10 +222,11 @@ export class OpenAIBackend extends LLMBackend {
     options?: LLMCompleteOptions & { signal?: AbortSignal },
   ): AsyncIterable<StreamChunk> {
     const maxTokens = options?.maxTokens ?? getMaxOutputTokens(this.providerName, this.model);
+    const fixedTemp = isFixedTemperatureModel(this.model);
     const params: OpenAI.ChatCompletionCreateParamsStreaming = {
       model: this.model,
       messages: this.convertMessages(messages),
-      temperature: options?.temperature ?? 0.2,
+      ...(fixedTemp ? {} : { temperature: options?.temperature ?? 0.2 }),
       ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
       stream: true,
     };

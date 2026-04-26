@@ -243,6 +243,16 @@ function validatePhase1Output(raw: unknown): ArchitectPhase1Output {
     }
   }
 
+  // v3.2: Design rationale (cross-cutting WHY for handshake/clocking/reset)
+  if (obj.designRationale && typeof obj.designRationale === 'object' && !Array.isArray(obj.designRationale)) {
+    const dr = obj.designRationale as Record<string, unknown>;
+    const rationale: NonNullable<ArchitectPhase1Output['designRationale']> = {};
+    if (typeof dr.handshake === 'string' && dr.handshake.trim()) rationale.handshake = dr.handshake.trim();
+    if (typeof dr.clockDomains === 'string' && dr.clockDomains.trim()) rationale.clockDomains = dr.clockDomains.trim();
+    if (typeof dr.resetStrategy === 'string' && dr.resetStrategy.trim()) rationale.resetStrategy = dr.resetStrategy.trim();
+    if (Object.keys(rationale).length > 0) result.designRationale = rationale;
+  }
+
   // v3.1: Filelists
   if (Array.isArray(obj.filelists)) {
     result.filelists = (obj.filelists as unknown[])
@@ -334,6 +344,7 @@ async function logLLMTrace(
   await ctx.logTrace({
     timestamp: new Date().toISOString(),
     role: 'Architect-P1',
+    module: '_global',
     promptTokens: response.usage.promptTokens,
     completionTokens: response.usage.completionTokens,
     durationMs: extra?.durationMs ?? 0,
@@ -872,6 +883,17 @@ export function formatArchitectureSummary(phase1: ArchitectPhase1Output): string
 
   if (phase1.resetStrategy) {
     lines.push(`Reset strategy: ${phase1.resetStrategy}`);
+  }
+
+  if (phase1.designRationale) {
+    const dr = phase1.designRationale;
+    if (dr.handshake || dr.clockDomains || dr.resetStrategy) {
+      lines.push('');
+      lines.push('Design rationale:');
+      if (dr.handshake)     lines.push(`  Handshake: ${dr.handshake}`);
+      if (dr.clockDomains)  lines.push(`  Clocking:  ${dr.clockDomains}`);
+      if (dr.resetStrategy) lines.push(`  Reset:     ${dr.resetStrategy}`);
+    }
   }
 
   lines.push('');

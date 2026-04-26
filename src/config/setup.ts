@@ -5,7 +5,7 @@
 import * as readline from 'node:readline';
 import type { ConfigManager } from './manager.js';
 import type { LLMConfig, LLMProvider } from './schema.js';
-import { DEFAULT_MODELS, PROVIDER_MODELS } from '../llm/factory.js';
+import { getDefaultModel, PROVIDER_MODELS } from '../llm/factory.js';
 
 async function ask(rl: readline.Interface, question: string, defaultVal?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -26,13 +26,14 @@ async function select(rl: readline.Interface, question: string, options: string[
 
 async function selectModel(rl: readline.Interface, provider: LLMProvider): Promise<string> {
   const models = PROVIDER_MODELS[provider] ?? [];
+  const defaultModel = getDefaultModel(provider);
   if (models.length === 0) {
-    return await ask(rl, 'Model name', DEFAULT_MODELS[provider]);
+    return await ask(rl, 'Model name', defaultModel);
   }
   const options = [...models, '[ Custom model name ]'];
   const choice = await select(rl, `Select model for ${provider}:`, options);
   if (choice === '[ Custom model name ]') {
-    return await ask(rl, 'Enter model name', DEFAULT_MODELS[provider]);
+    return await ask(rl, 'Enter model name', defaultModel);
   }
   return choice;
 }
@@ -40,12 +41,12 @@ async function selectModel(rl: readline.Interface, provider: LLMProvider): Promi
 // Provider display labels → provider key
 const PROVIDER_OPTIONS: Array<{ label: string; key: LLMProvider; needsKey: boolean }> = [
   { label: 'OpenAI (GPT-4.1, o3, o4-mini ...)',          key: 'openai',     needsKey: true },
-  { label: 'Anthropic (Claude Opus 4, Sonnet 4 ...)',     key: 'anthropic',  needsKey: true },
+  { label: 'Anthropic (Claude Sonnet 4.6, Opus 4.6 ...)', key: 'anthropic',  needsKey: true },
   { label: 'Google Gemini (gemini-3.1-pro-preview, gemini-2.5-flash)', key: 'gemini', needsKey: true },
   { label: 'DeepSeek (DeepSeek-V3, DeepSeek-R1)',        key: 'deepseek',   needsKey: true },
-  { label: 'Kimi / Moonshot (moonshot-v1-128k)',          key: 'kimi',       needsKey: true },
-  { label: 'Qwen / DashScope (qwen-max, qwen-plus)',     key: 'qwen',       needsKey: true },
-  { label: 'ZAI / Zhipu (GLM-4.7, GLM-5, GLM-5-Turbo)', key: 'zhipu',      needsKey: true },
+  { label: 'Kimi (kimi-k2.5, kimi-k2 ...)',               key: 'kimi',       needsKey: true },
+  { label: 'Qwen / DashScope (qwen3-max, qwen3.6-plus)', key: 'qwen',       needsKey: true },
+  { label: 'ZAI / Zhipu (GLM-5.1, GLM-5, GLM-4.7)',     key: 'zhipu',      needsKey: true },
   { label: 'Ollama (local, no API key)',                  key: 'ollama',     needsKey: false },
   { label: 'OpenAI-compatible (custom endpoint)',         key: 'openai-compatible', needsKey: true },
 ];

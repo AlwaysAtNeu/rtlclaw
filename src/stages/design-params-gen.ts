@@ -8,12 +8,18 @@
 import type { ArchitectPhase1Output } from '../agents/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 
-/** Append +incdir+ to filelist only if not already present. */
+/**
+ * Append +incdir+ to filelist only if not already present.
+ * Line-based check (not substring) so e.g. `+incdir+./macro` does not
+ * falsely shadow `+incdir+./macro2`. The downstream writeFile handler
+ * also dedups, so this early check is just an optimization.
+ */
 async function appendIncdirIfNeeded(ctx: StageContext, dir: string): Promise<void> {
   const incdirLine = `+incdir+${dir}`;
   try {
     const existing = await ctx.readFile(ctx.filelistPath);
-    if (existing.includes(incdirLine)) return; // Already present
+    const existingLines = existing.split('\n').map(l => l.trim());
+    if (existingLines.includes(incdirLine)) return; // Already present
   } catch { /* filelist doesn't exist yet, proceed */ }
 
   await ctx.executeAction({
@@ -76,7 +82,17 @@ async function* generateVerilogDefines(
 
   yield { type: 'progress', content: `Generated ${filePath} (${Object.keys(params).length} parameters)` };
 
-  // Append +incdir+ to filelist (skip if already present from Architect's initialContent)
+  // Compile .vh into filelist so `define macros are visible to RTL without `include
+  await ctx.executeAction({
+    type: 'writeFile',
+    payload: {
+      path: ctx.filelistPath,
+      content: filePath,
+      append: true,
+    },
+  });
+
+  // Also add incdir for any `include usage (skip if already present)
   await appendIncdirIfNeeded(ctx, 'hw/src/macro');
 
   yield { type: 'status', content: 'Design parameters file generated (Verilog `define format).' };

@@ -6,7 +6,17 @@
  * calls the LLM once (non-streaming), and processes the result.
  */
 
-import type { Action, ArchitectPhase2Output, DebugDiagnosis, PortDef, InterfaceContract } from '../agents/types.js';
+import type {
+  Action,
+  ArchitectPhase2Output,
+  AttemptRecord,
+  DebugDiagnosis,
+  DesignRationale,
+  InterfaceContract,
+  PartialAttemptRecord,
+  PortDef,
+  StageAttemptResult,
+} from '../agents/types.js';
 import type { Message } from '../llm/types.js';
 import type { OutputChunk, StageContext } from './types.js';
 import {
@@ -16,6 +26,8 @@ import {
   buildRTLDebugWithVerifReqMessages,
   buildSignalSelectMessages,
 } from '../agents/context-builder.js';
+import { extractErrorSignature } from '../utils/error-signature.js';
+import { computeDiff } from '../utils/diff-attempt.js';
 
 /** Sum total characters in a message array (for trace logging). */
 function promptChars(msgs: Message[]): number {
@@ -79,14 +91,31 @@ export async function* writeModule(
   dependentModulePorts: Array<{ name: string; ports: PortDef[] }>,
   hdlStandard?: string,
   interfaceContracts?: InterfaceContract[],
-  previousLintError?: string,
-): AsyncGenerator<OutputChunk> {
+  attemptHistory?: AttemptRecord[],
+  designRationale?: DesignRationale,
+): AsyncGenerator<OutputChunk, PartialAttemptRecord> {
   const moduleName = phase2Design.moduleName;
 
   yield { type: 'status', content: `Writing RTL for module "${moduleName}"...` };
 
-  // Build messages and call LLM (v3: pass interface contracts)
-  const messages = buildRTLWriteMessages(phase2Design, dependentModulePorts, hdlStandard, interfaceContracts, previousLintError);
+  // Read previous file content (if any) so we can diff. For an initial write
+  // this is empty; for a fresh rewrite triggered by repeated lint failures
+  // this gives the LLM-vs-LLM diff that the orchestrator surfaces in the
+  // next attempt's prompt.
+  const expectedPath = `hw/src/hdl/${moduleName}.sv`;
+  let beforeContent = '';
+  try { beforeContent = await ctx.readFile(expectedPath); } catch {
+    try { beforeContent = await ctx.readFile(`hw/src/hdl/${moduleName}.v`); } catch { /* fresh write, no before */ }
+  }
+
+  // Carry forward the most recent error signature so this attempt's record
+  // remembers what triggered it (e.g. the lint failure that forced a rewrite).
+  const triggerError = attemptHistory && attemptHistory.length > 0
+    ? attemptHistory[attemptHistory.length - 1]
+    : undefined;
+
+  // Build messages and call LLM (v3: pass interface contracts; v3.2: rationale)
+  const messages = buildRTLWriteMessages(phase2Design, dependentModulePorts, hdlStandard, interfaceContracts, attemptHistory, designRationale);
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages, { signal: ctx.signal });
   const durationMs = Date.now() - startMs;
@@ -100,6 +129,7 @@ export async function* writeModule(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'RTLDesigner',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -118,7 +148,14 @@ export async function* writeModule(
 
   if (!hasCode) {
     yield { type: 'error', content: `No code blocks found in LLM response for module "${moduleName}".` };
-    return;
+    return {
+      stage: 'rtl_write',
+      author: 'llm',
+      errorRaw: triggerError?.errorRaw,
+      errorSig: triggerError?.errorSig,
+      summary: `no code produced for ${moduleName}`,
+      file: expectedPath,
+    };
   }
 
   yield {
@@ -127,10 +164,17 @@ export async function* writeModule(
   };
 
   // Execute writeFile actions
+  let primaryFile = expectedPath;
+  let primaryContent = '';
   for (const action of actions) {
     const filePath = action.payload['path'] as string;
     try {
       await ctx.executeAction(action);
+      // Capture content of the module's primary file for diff
+      if (filePath.endsWith(`/${moduleName}.sv`) || filePath.endsWith(`/${moduleName}.v`)) {
+        primaryFile = filePath;
+        primaryContent = (action.payload['content'] as string) ?? '';
+      }
       yield {
         type: 'progress',
         content: `Wrote file: ${filePath}`,
@@ -168,6 +212,16 @@ export async function* writeModule(
     content: `RTL generation complete for module "${moduleName}".`,
     metadata: { moduleName, artifacts: artifacts.length },
   };
+
+  return {
+    stage: 'rtl_write',
+    author: 'llm',
+    errorRaw: triggerError?.errorRaw,
+    errorSig: triggerError?.errorSig,
+    summary: `wrote ${actions.length} file(s) for ${moduleName}`,
+    diff: computeDiff(beforeContent, primaryContent),
+    file: primaryFile,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -179,33 +233,48 @@ export async function fixLintErrors(
   moduleName: string,
   lintOutput: string,
   hdlStandard?: string,
-): Promise<boolean> {
+  attemptHistory?: AttemptRecord[],
+): Promise<StageAttemptResult> {
+  const errorSig = extractErrorSignature(lintOutput);
   // Read current RTL code
   const filePath = `hw/src/hdl/${moduleName}.sv`;
   let rtlCode: string;
+  let resolvedPath = filePath;
   try {
     rtlCode = await ctx.readFile(filePath);
   } catch {
     // Try .v extension as fallback
     try {
       rtlCode = await ctx.readFile(`hw/src/hdl/${moduleName}.v`);
+      resolvedPath = `hw/src/hdl/${moduleName}.v`;
     } catch {
       if (ctx.logTrace) {
         await ctx.logTrace({
           timestamp: new Date().toISOString(),
           role: 'RTLDesigner',
+          module: moduleName,
           promptTokens: 0,
           completionTokens: 0,
           durationMs: 0,
           taskContext: `fixLintErrors:${moduleName}:file_not_found`,
         });
       }
-      return false;
+      return {
+        ok: false,
+        record: {
+          stage: 'rtl_lint_fix',
+          author: 'llm',
+          errorRaw: lintOutput.slice(0, 2000),
+          errorSig,
+          summary: `RTL file not found for ${moduleName}`,
+          file: filePath,
+        },
+      };
     }
   }
 
   // Build messages and call LLM
-  const messages = buildRTLLintFixMessages(moduleName, lintOutput, rtlCode, hdlStandard);
+  const messages = buildRTLLintFixMessages(moduleName, lintOutput, rtlCode, hdlStandard, attemptHistory);
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages, { signal: ctx.signal });
   const durationMs = Date.now() - startMs;
@@ -218,6 +287,7 @@ export async function fixLintErrors(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'RTLDesigner',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -233,22 +303,53 @@ export async function fixLintErrors(
   }
 
   if (!hasCode) {
-    return false;
+    return {
+      ok: false,
+      record: {
+        stage: 'rtl_lint_fix',
+        author: 'llm',
+        errorRaw: lintOutput.slice(0, 2000),
+        errorSig,
+        summary: `no code produced for ${moduleName} lint fix`,
+        file: resolvedPath,
+      },
+    };
   }
 
   // Write the first code block as the fixed file
   const fixAction = actions[0]!;
   const fixedContent = fixAction.payload['content'] as string;
-  const targetPath = (fixAction.payload['path'] as string) || filePath;
+  const targetPath = (fixAction.payload['path'] as string) || resolvedPath;
 
   try {
     await ctx.executeAction({
       type: 'writeFile',
       payload: { path: targetPath, content: fixedContent },
     });
-    return true;
+    return {
+      ok: true,
+      record: {
+        stage: 'rtl_lint_fix',
+        author: 'llm',
+        errorRaw: lintOutput.slice(0, 2000),
+        errorSig,
+        summary: `lint fix applied for ${moduleName} (${errorSig.tool}/${errorSig.tag})`,
+        diff: computeDiff(rtlCode, fixedContent),
+        file: targetPath,
+      },
+    };
   } catch {
-    return false;
+    return {
+      ok: false,
+      record: {
+        stage: 'rtl_lint_fix',
+        author: 'llm',
+        errorRaw: lintOutput.slice(0, 2000),
+        errorSig,
+        summary: `write failed for ${moduleName} lint fix`,
+        file: targetPath,
+      },
+    };
   }
 }
 
@@ -273,6 +374,7 @@ export async function selectVCDSignals(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'RTLDesigner',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -313,21 +415,35 @@ export async function debugFix(
   checkerOutput: string,
   funcDescription: string,
   verificationReqs?: string,
-  debugHistory?: string[],
+  attemptHistory?: AttemptRecord[],
   vcdData?: string,
-): Promise<DebugDiagnosis> {
+  designRationale?: DesignRationale,
+): Promise<{ diagnosis: DebugDiagnosis; record: PartialAttemptRecord }> {
+  const errorSig = extractErrorSignature(checkerOutput);
   // Read current RTL code
   const filePath = `hw/src/hdl/${moduleName}.sv`;
   let rtlCode: string;
+  let resolvedPath = filePath;
   try {
     rtlCode = await ctx.readFile(filePath);
   } catch {
     try {
       rtlCode = await ctx.readFile(`hw/src/hdl/${moduleName}.v`);
+      resolvedPath = `hw/src/hdl/${moduleName}.v`;
     } catch {
       return {
-        diagnosis: 'fix',
-        reason: `Cannot read RTL file for module "${moduleName}".`,
+        diagnosis: {
+          diagnosis: 'fix',
+          reason: `Cannot read RTL file for module "${moduleName}".`,
+        },
+        record: {
+          stage: 'rtl_debug_fix',
+          author: 'llm',
+          errorRaw: checkerOutput.slice(0, 2000),
+          errorSig,
+          summary: `RTL file not found for ${moduleName}`,
+          file: filePath,
+        },
       };
     }
   }
@@ -340,10 +456,11 @@ export async function debugFix(
         rtlCode,
         funcDescription,
         verificationReqs,
-        debugHistory,
+        attemptHistory,
         vcdData,
+        designRationale,
       )
-    : buildRTLDebugFixMessages(moduleName, checkerOutput, rtlCode, funcDescription, debugHistory, vcdData);
+    : buildRTLDebugFixMessages(moduleName, checkerOutput, rtlCode, funcDescription, attemptHistory, vcdData, designRationale);
 
   const pChars = promptChars(messages);
   const startMs = Date.now();
@@ -369,6 +486,7 @@ export async function debugFix(
       await ctx.logTrace({
         timestamp: new Date().toISOString(),
         role: 'RTLDesigner',
+        module: moduleName,
         promptTokens: response.usage.promptTokens,
         completionTokens: response.usage.completionTokens,
         durationMs,
@@ -382,7 +500,17 @@ export async function debugFix(
         responseContent: responseText,
       });
     }
-    return { diagnosis: 'tb_suspect', reason };
+    return {
+      diagnosis: { diagnosis: 'tb_suspect', reason },
+      record: {
+        stage: 'rtl_debug_fix',
+        author: 'llm',
+        errorRaw: checkerOutput.slice(0, 2000),
+        errorSig,
+        summary: `tb_suspect: ${reason.slice(0, 150)}`,
+        file: resolvedPath,
+      },
+    };
   }
 
   // v3: Parse fix_summary from JSON block before code
@@ -412,6 +540,7 @@ export async function debugFix(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'RTLDesigner',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -429,7 +558,7 @@ export async function debugFix(
   if (hasCode) {
     const fixAction = actions[0]!;
     const fixedCode = fixAction.payload['content'] as string;
-    const targetFile = (fixAction.payload['path'] as string) || filePath;
+    const targetFile = (fixAction.payload['path'] as string) || resolvedPath;
 
     // Write the fixed file
     try {
@@ -441,13 +570,34 @@ export async function debugFix(
       // Return the diagnosis even if write fails — caller can retry
     }
 
-    return { diagnosis: 'fix', fixedCode, targetFile, fix_summary: fixSummary };
+    return {
+      diagnosis: { diagnosis: 'fix', fixedCode, targetFile, fix_summary: fixSummary },
+      record: {
+        stage: 'rtl_debug_fix',
+        author: 'llm',
+        errorRaw: checkerOutput.slice(0, 2000),
+        errorSig,
+        summary: fixSummary ?? `RTL debug fix applied for ${moduleName}`,
+        diff: computeDiff(rtlCode, fixedCode),
+        file: targetFile,
+      },
+    };
   }
 
   // No code blocks and no tb_suspect — return a fix diagnosis with no code
   return {
-    diagnosis: 'fix',
-    reason: 'LLM response did not contain extractable code blocks.',
-    fix_summary: fixSummary,
+    diagnosis: {
+      diagnosis: 'fix',
+      reason: 'LLM response did not contain extractable code blocks.',
+      fix_summary: fixSummary,
+    },
+    record: {
+      stage: 'rtl_debug_fix',
+      author: 'llm',
+      errorRaw: checkerOutput.slice(0, 2000),
+      errorSig,
+      summary: fixSummary ?? `no code in debug response for ${moduleName}`,
+      file: resolvedPath,
+    },
   };
 }

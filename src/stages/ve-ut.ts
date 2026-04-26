@@ -9,7 +9,13 @@
  * definitions and verification requirements from the Architect.
  */
 
-import type { PortDef, InterfaceContract } from '../agents/types.js';
+import type {
+  AttemptRecord,
+  InterfaceContract,
+  PartialAttemptRecord,
+  PortDef,
+  StageAttemptResult,
+} from '../agents/types.js';
 import type { Message } from '../llm/types.js';
 import type { StageContext, OutputChunk } from './types.js';
 import {
@@ -18,6 +24,8 @@ import {
   buildVECompileFixMessages,
   buildSpecCheckerAuditMessages,
 } from '../agents/context-builder.js';
+import { extractErrorSignature } from '../utils/error-signature.js';
+import { computeDiff } from '../utils/diff-attempt.js';
 
 function promptChars(msgs: Message[]): number {
   return msgs.reduce((sum, m) => sum + m.content.length, 0);
@@ -156,6 +164,7 @@ export async function* generateUTTestbench(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'VerificationEngineer',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -304,6 +313,7 @@ export async function reviewTB(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'VerificationEngineer',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -436,13 +446,24 @@ export async function addVCDToTB(
 
 /**
  * Fix compilation errors in TB/TC files by calling the VE LLM.
- * Returns true if a fix was applied.
+ * Returns a StageAttemptResult with the structured record for the orchestrator
+ * to enroll into module attemptHistory.
  */
 export async function fixCompileErrors(
   ctx: StageContext,
   moduleName: string,
   compileErrors: string,
-): Promise<boolean> {
+  attemptHistory?: AttemptRecord[],
+): Promise<StageAttemptResult> {
+  const errorSig = extractErrorSignature(compileErrors);
+  const errorRaw = compileErrors.slice(0, 2000);
+  const baseRecord: Omit<PartialAttemptRecord, 'summary' | 'diff'> = {
+    stage: 've_tb_compile_fix',
+    author: 'llm',
+    errorRaw,
+    errorSig,
+  };
+
   // Read current TB
   const tbPathSV = `hw/dv/ut/sim/tb/tb_${moduleName}.sv`;
   const tbPathV = `hw/dv/ut/sim/tb/tb_${moduleName}.v`;
@@ -457,7 +478,10 @@ export async function fixCompileErrors(
       tbCode = await ctx.readFile(tbPathV);
       tbPath = tbPathV;
     } catch {
-      return false;
+      return {
+        ok: false,
+        record: { ...baseRecord, summary: `TB file not found for ${moduleName}`, file: tbPathSV },
+      };
     }
   }
 
@@ -511,7 +535,7 @@ export async function fixCompileErrors(
     }
   }
 
-  const messages = buildVECompileFixMessages(moduleName, compileErrors, tbCode, tcs, extraContext);
+  const messages = buildVECompileFixMessages(moduleName, compileErrors, tbCode, tcs, extraContext, attemptHistory);
 
   const startMs = Date.now();
   const response = await ctx.llm.complete(messages, { temperature: 0.1, signal: ctx.signal });
@@ -523,6 +547,7 @@ export async function fixCompileErrors(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'VerificationEngineer',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,
@@ -541,17 +566,35 @@ export async function fixCompileErrors(
 
   // Write ALL code blocks from the response (LLM may fix multiple files)
   if (blocks.length > 0) {
+    let primaryDiff = '';
+    let primaryPath = tbPath;
     for (const block of blocks) {
       const targetPath = block.path?.startsWith('hw/') ? block.path : tbPath;
+      // Diff vs previous content of the TB if that's the file being changed
+      if (targetPath === tbPath) {
+        primaryDiff = computeDiff(tbCode, block.content);
+        primaryPath = targetPath;
+      }
       await ctx.executeAction({
         type: 'writeFile',
         payload: { path: targetPath, content: block.content },
       });
     }
-    return true;
+    return {
+      ok: true,
+      record: {
+        ...baseRecord,
+        summary: `TB compile fix applied (${blocks.length} file(s)) for ${moduleName} (${errorSig.tool}/${errorSig.tag})`,
+        diff: primaryDiff || `[${blocks.length} file(s) changed; primary diff unavailable]`,
+        file: primaryPath,
+      },
+    };
   }
 
-  return false;
+  return {
+    ok: false,
+    record: { ...baseRecord, summary: `no code in TB compile fix response for ${moduleName}`, file: tbPath },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +635,7 @@ export async function auditSpecVsChecker(
     await ctx.logTrace({
       timestamp: new Date().toISOString(),
       role: 'VerificationAuditor',
+      module: moduleName,
       promptTokens: response.usage.promptTokens,
       completionTokens: response.usage.completionTokens,
       durationMs,

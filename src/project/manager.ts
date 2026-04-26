@@ -314,7 +314,23 @@ export class ProjectManager {
     const filePath = path.join(path.resolve(rootPath), META_DIR, STATE_FILE);
     try {
       const raw = await fs.readFile(filePath, 'utf-8');
-      return JSON.parse(raw) as WorkflowState;
+      const parsed = JSON.parse(raw) as WorkflowState;
+      // v4: schema version check. State files written before the v4 schema
+      // change carry no schemaVersion (or a lower one). attemptHistory and
+      // related fields don't exist on those, so loading would corrupt the
+      // workflow. Discard with a one-line warning rather than attempt
+      // migration — Phase 1 deliberately drops legacy state.
+      const REQUIRED_VERSION = 4;
+      const version = parsed.schemaVersion ?? 0;
+      if (version < REQUIRED_VERSION) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[rtl-claw] Discarding state.json with schema v${version} ` +
+          `(current is v${REQUIRED_VERSION}). Workflow will start fresh.`,
+        );
+        return null;
+      }
+      return parsed;
     } catch {
       return null;
     }
@@ -328,27 +344,6 @@ export class ProjectManager {
   async clearWorkflowState(rootPath: string): Promise<void> {
     const filePath = path.join(path.resolve(rootPath), META_DIR, STATE_FILE);
     try { await fs.unlink(filePath); } catch { /* ignore */ }
-  }
-
-  // -----------------------------------------------------------------------
-  // Filelist management
-  // -----------------------------------------------------------------------
-
-  async appendToFilelist(rootPath: string, hdlFile: string, customFilelistPath?: string): Promise<void> {
-    const absRoot = path.resolve(rootPath);
-    const flPath = customFilelistPath ?? DEFAULT_FILELIST;
-    const filelistPath = path.join(absRoot, flPath);
-    const filelistDir = path.dirname(filelistPath);
-    const relativePath = path.relative(filelistDir, path.join(absRoot, hdlFile));
-
-    try {
-      const content = await fs.readFile(filelistPath, 'utf-8');
-      if (!content.includes(relativePath)) {
-        await fs.appendFile(filelistPath, `${relativePath}\n`, 'utf-8');
-      }
-    } catch {
-      await fs.writeFile(filelistPath, `// RTL-Claw design filelist\n+incdir+../macro\n${relativePath}\n`, 'utf-8');
-    }
   }
 
   // -----------------------------------------------------------------------

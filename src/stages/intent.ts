@@ -76,6 +76,7 @@ export async function classifyIntent(
       await logTrace({
         timestamp: new Date().toISOString(),
         role: 'intent',
+        module: '_global',
         promptTokens: response.usage.promptTokens,
         completionTokens: response.usage.completionTokens,
         durationMs,

@@ -60,6 +60,15 @@ export interface LLMTraceEntry {
   completionTokens: number;
   durationMs: number;
   taskContext?: string;
+  /**
+   * Module name — used to group trace files per module for readability.
+   * For pre-module-split stages (intent classification, architect P1), pass '_global'
+   * explicitly so the choice of "no module context" is visible at the call site
+   * rather than being a silent fallback.
+   */
+  module: string;
+  /** Debug iteration number (1-based) for debug fix / simulation entries */
+  iteration?: number;
   /** Prompt size in characters (for diagnosing token estimation issues) */
   promptChars?: number;
   /** Response size in characters */

@@ -68,7 +68,7 @@ export interface AppConfig {
 export const DEFAULT_CONFIG: AppConfig = {
   llm: {
     provider: 'openai',
-    model: 'gpt-4o',
+    model: 'gpt-4.1',
     temperature: 0.2,
     timeoutMs: 600000,
   },

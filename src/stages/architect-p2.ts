@@ -8,14 +8,22 @@
  * This stage is NOT shown to the user — it only yields 'progress' chunks.
  */
 
-import type { LLMResponse } from '../llm/types.js';
+import type { LLMResponse, Message } from '../llm/types.js';
 import type {
   ArchitectPhase1Output,
   ArchitectPhase2Output,
+  FailureReport,
   ModuleVerificationReq,
 } from '../agents/types.js';
 import type { StageContext, OutputChunk } from './types.js';
-import { buildArchitectP2Messages } from '../agents/context-builder.js';
+import {
+  buildArchitectP2Messages,
+  buildArchitectP2RevisionMessages,
+} from '../agents/context-builder.js';
+
+function promptChars(msgs: Message[]): number {
+  return msgs.reduce((sum, m) => sum + m.content.length, 0);
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -112,15 +120,28 @@ async function logLLMTrace(
   ctx: StageContext,
   response: LLMResponse,
   moduleName: string,
+  messages: Message[],
+  durationMs: number,
+  parseSuccess: boolean,
 ): Promise<void> {
   if (!ctx.logTrace) return;
   await ctx.logTrace({
     timestamp: new Date().toISOString(),
     role: 'Architect-P2',
+    module: moduleName,
     promptTokens: response.usage.promptTokens,
     completionTokens: response.usage.completionTokens,
-    durationMs: 0,
+    durationMs,
     taskContext: `architect_p2:${moduleName}`,
+    promptChars: promptChars(messages),
+    responseChars: response.content.length,
+    hasCodeBlock: false,
+    retryCount: response.retryCount,
+    summary: parseSuccess
+      ? `P2 design generated for ${moduleName}`
+      : `P2 parse failed for ${moduleName}`,
+    promptContent: messages,
+    responseContent: response.content,
   });
 }
 
@@ -150,6 +171,7 @@ export async function* runArchitectPhase2(
     }
 
     let response: LLMResponse;
+    const startMs = Date.now();
     try {
       response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
     } catch (err) {
@@ -159,16 +181,17 @@ export async function* runArchitectPhase2(
       };
       return;
     }
-
-    await logLLMTrace(ctx, response, moduleName);
+    const durationMs = Date.now() - startMs;
 
     const parsed = extractJsonFromText(response.content);
     if (parsed !== null) {
       try {
         phase2Output = validatePhase2Output(parsed, moduleName);
+        await logLLMTrace(ctx, response, moduleName, messages, durationMs, true);
         break; // success
       } catch (parseErr) {
         const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+        await logLLMTrace(ctx, response, moduleName, messages, durationMs, false);
         if (attempt < MAX_PARSE_RETRIES) {
           yield {
             type: 'progress',
@@ -192,6 +215,7 @@ export async function* runArchitectPhase2(
         }
       }
     } else {
+      await logLLMTrace(ctx, response, moduleName, messages, durationMs, false);
       if (attempt < MAX_PARSE_RETRIES) {
         yield {
           type: 'progress',
@@ -234,4 +258,114 @@ export async function* runArchitectPhase2(
     content: `Architect Phase 2 complete for "${moduleName}".`,
     metadata: { phase2Output },
   };
+}
+
+// ---------------------------------------------------------------------------
+// runP2Revision (Phase 2b — cross-stage failure feedback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of an Architect P2 revision request. Two terminal shapes:
+ *  - { phase2: ArchitectPhase2Output } — architect issued a revised spec
+ *  - { revisionNotHelpful: true, reason: '...' } — architect declared this
+ *    module cannot be addressed at the P2 layer (orchestrator still consumes
+ *    one budget unit; reason flows into PastRevisionEntry.declaredReason)
+ *  - { error: '...' } — LLM call or parse failed; orchestrator should
+ *    treat as `manual_escalation` (no budget refunded — the LLM was paid)
+ */
+export type P2RevisionResult =
+  | { kind: 'revised'; phase2: ArchitectPhase2Output }
+  | { kind: 'not_helpful'; reason: string }
+  | { kind: 'error'; reason: string };
+
+/**
+ * Request a revised P2 specification given the previous P2 JSON and a
+ * structured FailureReport summarizing why the previous spec didn't
+ * converge. The architect prompt allows either a revised spec or an
+ * explicit `revisionNotHelpful` declaration.
+ */
+export async function* runP2Revision(
+  ctx: StageContext,
+  prevP2JSON: string,
+  failure: FailureReport,
+): AsyncGenerator<OutputChunk, P2RevisionResult> {
+  const moduleName = failure.module;
+  yield {
+    type: 'progress',
+    content: `Architect P2 revision: requesting revised spec for "${moduleName}"...`,
+  };
+
+  let messages = buildArchitectP2RevisionMessages(prevP2JSON, failure);
+
+  for (let attempt = 0; attempt <= MAX_PARSE_RETRIES; attempt++) {
+    if (attempt > 0) {
+      yield {
+        type: 'progress',
+        content: `Retrying P2 revision parse for "${moduleName}" (attempt ${attempt + 1})...`,
+      };
+    }
+
+    let response: LLMResponse;
+    const startMs = Date.now();
+    try {
+      response = await ctx.llm.complete(messages, { temperature: 0.2, signal: ctx.signal });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      yield { type: 'error', content: `LLM call failed for P2 revision of "${moduleName}": ${errMsg}` };
+      return { kind: 'error', reason: `LLM call failed: ${errMsg}` };
+    }
+    const durationMs = Date.now() - startMs;
+
+    const parsed = extractJsonFromText(response.content);
+    if (parsed === null) {
+      await logLLMTrace(ctx, response, moduleName, messages, durationMs, false);
+      if (attempt < MAX_PARSE_RETRIES) {
+        yield { type: 'progress', content: `No JSON in P2 revision response for "${moduleName}". Retrying...` };
+        messages = [
+          ...messages,
+          { role: 'assistant', content: response.content },
+          { role: 'user', content: 'Your response did not contain valid JSON. Output ONLY a JSON object — either a revised P2 spec or { revisionNotHelpful: true, reason: "..." }.' },
+        ];
+        continue;
+      }
+      yield { type: 'error', content: `No valid JSON in P2 revision after ${MAX_PARSE_RETRIES + 1} attempts.` };
+      return { kind: 'error', reason: 'Architect produced no parseable JSON for revision request.' };
+    }
+
+    // Branch 1: revisionNotHelpful declaration
+    if (typeof parsed === 'object' && parsed !== null && (parsed as Record<string, unknown>)['revisionNotHelpful'] === true) {
+      const reasonField = (parsed as Record<string, unknown>)['reason'];
+      const reason = typeof reasonField === 'string' && reasonField.trim().length > 0
+        ? reasonField
+        : 'Architect declared revision-not-helpful without a reason.';
+      await logLLMTrace(ctx, response, moduleName, messages, durationMs, true);
+      yield { type: 'status', content: `Architect declared revision not helpful for "${moduleName}": ${reason.slice(0, 200)}` };
+      return { kind: 'not_helpful', reason };
+    }
+
+    // Branch 2: revised P2 spec
+    try {
+      const phase2 = validatePhase2Output(parsed, moduleName);
+      await logLLMTrace(ctx, response, moduleName, messages, durationMs, true);
+      yield { type: 'status', content: `P2 revision accepted for "${moduleName}": ${phase2.utVerification.scenarios.length} scenarios.` };
+      return { kind: 'revised', phase2 };
+    } catch (parseErr) {
+      const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      await logLLMTrace(ctx, response, moduleName, messages, durationMs, false);
+      if (attempt < MAX_PARSE_RETRIES) {
+        yield { type: 'progress', content: `P2 revision validation error for "${moduleName}": ${errMsg}. Retrying...` };
+        messages = [
+          ...messages,
+          { role: 'assistant', content: response.content },
+          { role: 'user', content: `Your response could not be validated. Error: ${errMsg}\nOutput ONLY a valid JSON object — either a revised P2 spec or { revisionNotHelpful: true, reason: "..." }.` },
+        ];
+        continue;
+      }
+      yield { type: 'error', content: `P2 revision parse failed after ${MAX_PARSE_RETRIES + 1} attempts: ${errMsg}` };
+      return { kind: 'error', reason: `Validation failed: ${errMsg}` };
+    }
+  }
+
+  // Unreachable — loop body always returns
+  return { kind: 'error', reason: 'P2 revision loop exhausted without resolution.' };
 }

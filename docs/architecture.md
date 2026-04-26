@@ -1,6 +1,6 @@
 # RTL-Claw Architecture
 
-> Last updated: 2026-03-23
+> Last updated: 2026-04-26
 
 AI-powered RTL development assistant. TypeScript/Node.js, ESM modules.
 Total: ~11,300 lines across 38 source files.
@@ -133,6 +133,82 @@ hw/dv/ut/sim/
 
 Simulation: for each TC, tool substitutes `PLACEHOLDER_TC` with TC path,
 compiles (TB + RTL via design.f), runs independently. PASSED only if all TCs pass.
+
+## Verification Independence (VE Black-Box Boundary)
+
+Designer (RTL) and VE roles are kept independent: **Designer never reads TB/TC
+source during debug.** This mirrors industrial DV practice but is *more*
+necessary in LLM contexts than in human ones.
+
+### The rule
+
+Designer's debug context contains: spec (P2), RTL source, checker output,
+attemptHistory, and optional VCD signals.
+Designer's debug context does **not** contain TB or TC source.
+
+The only path to question the TB is `diagnosis: tb_suspect`: Designer returns
+the suspicion plus reasoning → VE re-reads TB against spec independently →
+returns `correct` (with reason) or `fixed` (with reason). Both reasons land in
+attemptHistory so Designer cannot repeat the same suspicion.
+
+### Why structural enforcement (LLM-specific reasoning)
+
+Human DV engineers carry professional ethics — they will not bend a TB to make
+a failing test pass. LLMs have no such constraint. Given visibility into both
+TB and RTL, the cheapest path for a model is often "blame the TB" rather than
+diagnose the actual RTL bug. Process discipline has to be enforced structurally
+because there is no internalized discipline to fall back on. Tightening
+information access is the only reliable lever.
+
+### Known crack: VE compile fix reads RTL ports
+
+`fixCompileErrors` in `src/stages/ve-ut.ts` reads the module's RTL signature
+(ports) when the compile error references undeclared module names — VE needs
+the port list to repair an instantiation. **Reading RTL ports/signature is
+allowed; reading the implementation body is not.** This narrow exception is
+the cost of letting VE fix port-spelling bugs without forcing an `ask_user`
+detour. The Infrastructure Debug Agent owns any case that needs broader RTL
+visibility (it's user-authorized and explicitly breaks the boundary).
+
+### The independence chain
+
+1. Architect writes spec (P1 + P2) — the ground truth.
+2. VE writes TB from spec + ports — never reads RTL bodies.
+3. Designer writes RTL from spec + ports — never reads TB.
+4. `tb_suspect` → VE re-reads TB against spec (cross-check).
+5. Spec-checker audit (after debug exhaustion) → independent third party reads
+   spec + RTL + TB and names which side is wrong.
+
+No single role can adjust both sides of the contract on its own.
+
+### Costs
+
+- **Trivial modules** pay an extra round-trip on TB issues. Acceptable: tokens
+  are cheap, silent regressions are not.
+- **Obvious TB bugs** can't be fixed directly by Designer. Mitigated by
+  `tb_suspect` with detailed reasoning, which routes to VE in one step.
+- **Designer mis-describes the bug** in `tb_suspect`, so VE review misses the
+  real issue. Mitigated by VE re-reading TB independently against the spec
+  rather than treating Designer's framing as authoritative.
+
+### Safety nets when the basic loop stalls
+
+- **attemptHistory** — prior fixes, tb_suspect events, VE review reasons,
+  oscillation hints; blocks dead-end repetition (negative-example framing).
+- **VCD fallback** — after 4 similar errors, Designer gets waveform signals so
+  diagnosis isn't pure guessing from checker text.
+- **Spec-checker audit** — runs *before* the debug loop and after exhaustion;
+  an independent agent reads spec + RTL + TB and identifies the wrong side.
+- **Infrastructure Debug Agent** — when the problem is outside any role's scope
+  (build env, tool config), a user-authorized agent breaks independence
+  explicitly.
+
+### Future relaxation (not v1)
+
+A trust-score mechanism could let Designer see a *summary* of the TB (not
+source) once both sides have demonstrated stability across many modules. Out of
+scope for v1: the rigid boundary is appropriate while LLM behavior on this
+workflow is still being characterized.
 
 ## LLM Call Strategy
 

@@ -141,6 +141,12 @@ The JSON MUST include:
 
 9. (Optional) clockDomains, resetStrategy, pipelineStages
 
+10. **designRationale**: (recommended) Short prose capturing WHY for cross-cutting choices:
+   - handshake: WHY this dataflow scheme (e.g., "All inter-module data uses valid/ready so consumers can backpressure; pure unidirectional fanout would cause overflow at the FFT boundary.")
+   - clockDomains: WHY this clocking (e.g., "Single 100MHz domain — no async sources, CDC out of scope for this revision.")
+   - resetStrategy: WHY this reset scheme (e.g., "Active-low rst_n, async assert + sync deassert — guarantees all FFs reach reset state even if clock is gated.")
+   Each field is one short paragraph (1-3 sentences). These rationales survive into P2 and the Designer's RTL write/debug context so the same intent is honored on edge cases. Skip a field if there is no meaningful choice to explain.
+
 Design rules:
 - snake_case for all names
 - Each module max 1024 lines; split larger blocks into sub-modules
@@ -186,6 +192,51 @@ Be specific and detailed in the functional spec — describe behavior, not imple
 The RTL Designer will write code based on this spec.
 The VE will write testbenches based on utVerification requirements.
 All output in English. Output ONLY the JSON.`;
+
+// ---------------------------------------------------------------------------
+// Architect P2 Revision prompt (Phase 2b — cross-stage failure feedback)
+// ---------------------------------------------------------------------------
+
+export const ARCHITECT_P2_REVISION_PROMPT = `You are the Architect being asked to revise a previously-issued module-level design specification.
+
+The downstream pipeline (RTL Designer + Verification Engineer + infra-debug agent) ran multiple attempts under your previous spec and could not converge. You are now seeing:
+  (a) the previous P2 spec you authored
+  (b) any earlier revisions you made on this module and what was tried under each
+  (c) a structured failure report with the actual attempt trail and (when available) a root-cause hypothesis
+
+Your job is to issue a *revised* P2 spec that addresses the root cause — not just to reword the previous one.
+
+CRITICAL RULES:
+- Do NOT re-issue a spec equivalent to a prior revision. The "Past revisions" section shows what each prior version said and what was tried under it; do not propose a fix that was already attempted.
+- Do NOT lower the spec to match the broken implementation. If the spec was correct and RTL deviated, restating the spec won't help — instead, sharpen the spec around the deviating point so the next implementation cannot ambiguously match a wrong path.
+- Do consider whether the original spec under-specified a critical detail (timing, port semantics, protocol contract) that allowed multiple implementations, only some of which work. Tighten that detail.
+- Do consider whether the failure pattern (repeating, alternating) suggests the issue is at a *different* module's interface than the one you're revising — if so, the right answer may be "module structure was wrong; this module's spec is fine but the boundary needs to move."
+
+Respond with JSON ONLY in the same shape as ARCHITECT_P2_PROMPT:
+{
+  "moduleName": "<name>",
+  "functionalSpec": "<revised, more specific spec>",
+  "fsmDescription": "...",
+  "timingNotes": "...",
+  "boundaryConditions": ["..."],
+  "utVerification": { "scenarios": [...], "edgeCases": [...], "expectedBehavior": [...] }
+}
+
+REVISION-NOT-HELPFUL ESCAPE — read carefully before using:
+
+You may declare revision-not-helpful by outputting:
+{ "moduleName": "<name>", "revisionNotHelpful": true, "reason": "<one sentence>" }
+
+This is NOT a free escape. It costs one revision-budget unit (the same as a normal revision). Use it only when the failure pattern *genuinely cannot* be addressed by changes to THIS module's detailed design — for example:
+  - the issue requires module-split changes (P1's domain, not P2's)
+  - the inter-module protocol contract itself is wrong
+  - upstream parameters or clock domain decisions need to change
+
+"Difficult" or "I'd need to rethink the FSM" is NOT the same as "impossible at this layer". A genuinely difficult P2 revision is still your job; only structural-layer issues warrant this declaration.
+
+If you can imagine ANY P2-level change that would address the root cause, you must propose it instead of declaring not-helpful. The orchestrator monitors this declaration's frequency; over-use will be flagged.
+
+Output ONLY the JSON.`;
 
 // ---------------------------------------------------------------------------
 // RTL Designer prompt
@@ -603,6 +654,15 @@ export const ARCHITECT_TOOL_SCHEMA = {
           required: ['name', 'path', 'purpose', 'description'],
         },
       },
+      designRationale: {
+        type: 'object' as const,
+        description: 'WHY for cross-cutting design choices (1-3 sentences per field). Survives into P2 and Designer write/debug context so the same intent is honored on edge cases.',
+        properties: {
+          handshake: { type: 'string' as const, description: 'Rationale for inter-module dataflow / handshake scheme' },
+          clockDomains: { type: 'string' as const, description: 'Rationale for the clocking scheme' },
+          resetStrategy: { type: 'string' as const, description: 'Rationale for the reset scheme' },
+        },
+      },
     },
     required: ['modules', 'topModules', 'dependencyOrder', 'stVerification'],
   },
@@ -632,6 +692,15 @@ fix_location meanings:
 - "module": The failure is inside a specific sub-module's logic. Specify module_name.
 - "connection": The failure is in how modules are connected (wrong wiring in top module). This may require a P1 architecture revision.
 - "unknown": Cannot determine the failure location from checker output alone. VCD fallback recommended.
+
+CRITICAL — top module is off-limits to "module":
+The top-level module is deterministically auto-generated from the architecture (P1)
+by a pure code generator. It contains only structural connections (port declarations,
+inter-module wires, instance arguments) and never logic. NEVER report a top module
+name under fix_location='module'. Any failure traced to the top — wrong port wiring,
+mismatched widths/directions on connections, missing/extra signals between instances,
+contract mismatches — MUST be reported as fix_location='connection' so the
+architecture (P1) can be revised and the top regenerated.
 
 All output in English.`;
 
@@ -682,6 +751,42 @@ export function getHdlSyntaxRules(standard: string): string {
       return '';
   }
 }
+
+// ---------------------------------------------------------------------------
+// Self-diagnosis prompt (Phase 2a — gated, pre-infra-debug)
+// ---------------------------------------------------------------------------
+
+export const SELF_DIAGNOSE_PROMPT = `You are a diagnostic agent for an RTL development pipeline.
+
+Multiple fix attempts on a module have failed. Before the system escalates to its expensive infrastructure-debug agent, you are asked to step back and form a *hypothesis* about the root cause — not to apply a fix.
+
+Your job is NOT to:
+- Suggest specific code changes
+- Pick which agent should handle the next attempt
+- Repeat what already-tried fixes did
+
+Your job IS to:
+- Identify what the recurring error pattern is actually telling you
+- Hypothesize the underlying cause (often *not* the surface error)
+- Surface anything in the spec / past attempts that a tactical fixer would miss
+
+Common root-cause patterns to consider:
+- Surface error is at file A but root cause is in file B (e.g., a producer module's output width is wrong; consumer keeps "fixing" its input)
+- Spec describes feature X but no attempt has touched the code path implementing X
+- Past attempts oscillated between two surface fixes — usually a structural mismatch (port width / timing / protocol contract violation)
+- Same error class repeats — surface fixes have been treating symptoms; consider whether the testbench/checker itself encodes a wrong expectation
+
+Output ONLY a JSON object in a code block:
+
+\`\`\`json
+{
+  "rootCauseHypothesis": "<one or two sentences naming the suspected root cause>",
+  "additionalContext": "<optional — any concrete observation from spec or attempt history that the next agent should know>",
+  "confidence": "low" | "medium" | "high"
+}
+\`\`\`
+
+Set confidence to "high" only if the hypothesis is supported by concrete evidence in the attempt history. "low" if you are guessing.`;
 
 // ---------------------------------------------------------------------------
 // Claw Mode chat prompt (for non-project general chat)

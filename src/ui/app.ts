@@ -174,6 +174,22 @@ function printHelp(): void {
 }
 
 // --------------------------------------------------------------------------
+// Duration formatting
+// --------------------------------------------------------------------------
+
+function formatDuration(ms: number): string {
+  if (ms < 0) ms = 0;
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin > 0 ? `${hr}h ${remMin}m` : `${hr}h`;
+}
+
+// --------------------------------------------------------------------------
 // Spinner
 // --------------------------------------------------------------------------
 
@@ -181,17 +197,29 @@ class Spinner {
   private frames = ['\u280B', '\u2819', '\u2839', '\u2838', '\u283C', '\u2834', '\u2826', '\u2827', '\u2807', '\u280F'];
   private idx = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private taskStartMs = 0;
 
   get isRunning(): boolean { return this.timer !== null; }
 
+  /** Mark the start of a new task — resets the elapsed timer. */
+  resetTimer(): void {
+    this.taskStartMs = Date.now();
+  }
+
+  /** Get elapsed time since last resetTimer(). */
+  get elapsed(): string {
+    return formatDuration(Date.now() - this.taskStartMs);
+  }
+
   start(label: string): void {
     this.stop();
-    process.stdout.write(`  ${chalk.yellow(this.frames[0])} ${chalk.yellow(label)}`);
+    const elapsedStr = () => chalk.dim(` ${formatDuration(Date.now() - this.taskStartMs)}`);
+    process.stdout.write(`  ${chalk.yellow(this.frames[0])} ${chalk.yellow(label)}${elapsedStr()}`);
     this.timer = setInterval(() => {
       this.idx = (this.idx + 1) % this.frames.length;
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
-      process.stdout.write(`  ${chalk.yellow(this.frames[this.idx])} ${chalk.yellow(label)}`);
+      process.stdout.write(`  ${chalk.yellow(this.frames[this.idx])} ${chalk.yellow(label)}${elapsedStr()}`);
     }, 80);
   }
 
@@ -245,11 +273,16 @@ async function executeAction(
       await fs.mkdir(path.dirname(filePath), { recursive: true });
 
       if (payload.append) {
-        // Append a line to a file (e.g. design.f filelist)
+        // Append a line to a file (e.g. design.f filelist).
+        // Line-based dedup (not substring) so e.g. `+incdir+foo` is not falsely
+        // shadowed by an existing `+incdir+foobar`, and `hw/src/hdl/foo.v` is
+        // not falsely shadowed by `hw/src/hdl/foobar.v`.
         const lineToAppend = payload.appendLine ?? payload.content;
+        const trimmed = lineToAppend.trim();
         try {
           const existing = await fs.readFile(filePath, 'utf-8');
-          if (!existing.includes(lineToAppend)) {
+          const existingLines = existing.split('\n').map(l => l.trim());
+          if (!existingLines.includes(trimmed)) {
             await fs.appendFile(filePath, `${lineToAppend}\n`, 'utf-8');
           }
         } catch {
@@ -337,6 +370,7 @@ async function executeAction(
         await logTrace({
           timestamp: new Date().toISOString(),
           role: 'EDA',
+          module: path.basename(payload.file, path.extname(payload.file)),
           promptTokens: 0, completionTokens: 0,
           durationMs: Date.now() - lintStartMs,
           event: 'action:lint',
@@ -457,6 +491,7 @@ async function executeAction(
             await logTrace({
               timestamp: new Date().toISOString(),
               role: 'EDA',
+              module: payload.module ?? '_global',
               promptTokens: 0, completionTokens: 0,
               durationMs: Date.now() - tcStartMs,
               event: 'action:sim',
@@ -502,6 +537,7 @@ async function executeAction(
           await logTrace({
             timestamp: new Date().toISOString(),
             role: 'EDA',
+            module: payload.module ?? '_global',
             promptTokens: 0, completionTokens: 0,
             durationMs: Date.now() - simStartMs,
             event: 'action:sim',
@@ -645,80 +681,228 @@ function buildSetenvPrefix(baseDir: string): string {
 // LLM trace logging
 // --------------------------------------------------------------------------
 
+/** Sanitize a string for use as a filename/directory component. */
+function safeName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+/**
+ * Per-session unique ID — appended to filenames to avoid cross-session collisions
+ * when the process restarts on the same day. Short enough to keep filenames readable.
+ */
+const sessionId = Date.now().toString(36).slice(-4); // e.g. "1k3f"
+
+/** Global trace sequence counter (session-scoped, monotonically increasing). */
+let traceSeqCounter = 0;
+
+/** Per-module step counter for readable file numbering within each module dir. */
+const moduleStepCounters = new Map<string, number>();
+
+/** Track which module timelines already have a header written this session. */
+const timelineInitialized = new Set<string>();
+
 async function writeLLMTrace(projectPath: string, entry: LLMTraceEntry): Promise<void> {
   const traceDir = path.join(projectPath, '.rtl-claw/logs/llm-trace');
   await fs.mkdir(traceDir, { recursive: true });
   const date = new Date().toISOString().split('T')[0];
 
-  // Machine-readable JSONL
-  const tracePath = path.join(traceDir, `trace-${date}.jsonl`);
-  await fs.appendFile(tracePath, JSON.stringify(entry) + '\n', 'utf-8');
-
-  // Human-readable log (quick scan)
-  const logPath = path.join(traceDir, `trace-${date}.log`);
   const time = entry.timestamp.split('T')[1]?.replace('Z', '') ?? '';
   const dur = entry.durationMs > 0 ? `${(entry.durationMs / 1000).toFixed(1)}s` : '-';
   const tokens = entry.promptTokens > 0 ? `${entry.promptTokens}→${entry.completionTokens}tok` : '';
   const retry = entry.retryCount ? ` retry=${entry.retryCount}` : '';
   const code = entry.hasCodeBlock !== undefined ? (entry.hasCodeBlock ? ' [code]' : ' [no-code]') : '';
   const chars = entry.responseChars !== undefined ? ` ${entry.responseChars}ch` : '';
+  const globalSeq = String(++traceSeqCounter).padStart(3, '0');
+
+  // ----- 1. Machine-readable JSONL -----
+  const tracePath = path.join(traceDir, `trace-${date}.jsonl`);
+  const jsonlPromise = fs.appendFile(tracePath, JSON.stringify(entry) + '\n', 'utf-8');
+
+  // ----- 2. Human-readable summary log -----
   const tag = entry.event ?? entry.role;
+  const mod = `[${entry.module}]`;
+  const iter = entry.iteration !== undefined ? `#${entry.iteration}` : '';
   const summary = entry.summary ?? entry.taskContext ?? '';
-  // Add separator line for workflow phase transitions to make log scannable
   let prefix = '';
   if (entry.event === 'workflow' && entry.summary?.startsWith('start')) {
     prefix = `\n${'─'.repeat(60)}\n`;
   }
-  const line = `${prefix}[${time}] ${tag.padEnd(20)} ${dur.padStart(7)} ${tokens.padStart(14)}${retry}${code}${chars}  ${summary}\n`;
-  await fs.appendFile(logPath, line, 'utf-8');
 
-  // Full prompt/response content log (for deep debugging)
+  // Pre-compute the detail filename for cross-reference (if detail will be written)
+  let detailFileName: string | undefined;
   if (entry.promptContent || entry.responseContent) {
-    const detailDir = path.join(traceDir, 'detail');
-    await fs.mkdir(detailDir, { recursive: true });
-    // Use sequential numbering + readable context for filename
-    // Count existing files to get sequence number
-    let seq: string;
-    try {
-      const existing = await fs.readdir(detailDir);
-      seq = String(existing.length + 1).padStart(3, '0');
-    } catch { seq = '001'; }
-    const ctx = (entry.taskContext ?? 'unknown').replace(/[^a-zA-Z0-9_:-]/g, '_');
-    const role = entry.role.toLowerCase();
-    const detailPath = path.join(detailDir, `${seq}_${role}_${ctx}.md`);
-
-    let detail = `# ${seq} — ${entry.role}: ${entry.taskContext ?? 'LLM Call'}\n\n`;
-    detail += `| Field | Value |\n|-------|-------|\n`;
-    detail += `| Time | ${entry.timestamp} |\n`;
-    detail += `| Role | ${entry.role} |\n`;
-    detail += `| Duration | ${dur} |\n`;
-    detail += `| Tokens | ${entry.promptTokens} prompt → ${entry.completionTokens} completion |\n`;
-    detail += `| Prompt chars | ${entry.promptChars ?? '?'} |\n`;
-    detail += `| Response chars | ${entry.responseChars ?? '?'} |\n`;
-    detail += `| Has code block | ${entry.hasCodeBlock ?? '?'} |\n`;
-    detail += `| Retry count | ${entry.retryCount ?? 0} |\n`;
-    if (entry.summary) detail += `| Summary | ${entry.summary} |\n`;
-    detail += '\n';
-    if (entry.promptContent) {
-      detail += '---\n\n## Prompt Messages\n\n';
-      for (let i = 0; i < entry.promptContent.length; i++) {
-        const msg = entry.promptContent[i];
-        const charCount = msg.content.length;
-        detail += `### Message ${i + 1}: [${msg.role.toUpperCase()}] (${charCount} chars)\n\n`;
-        // Truncate very long messages for readability, keep full version below
-        if (charCount > 3000) {
-          detail += '```\n' + msg.content.slice(0, 1500) + '\n\n... (' + (charCount - 3000) + ' chars truncated) ...\n\n' + msg.content.slice(-1500) + '\n```\n\n';
-        } else {
-          detail += '```\n' + msg.content + '\n```\n\n';
-        }
-      }
-    }
-    if (entry.responseContent) {
-      detail += '---\n\n## LLM Response\n\n';
-      detail += '```\n' + entry.responseContent + '\n```\n';
-    }
-    await fs.appendFile(detailPath, detail, 'utf-8');
+    const moduleSafe = safeName(entry.module);
+    const step = (moduleStepCounters.get(moduleSafe) ?? 0) + 1;
+    // Don't increment yet — writeModuleDetail will do that
+    const phase = describePhase(entry);
+    const iterSuffix = entry.iteration !== undefined ? `_iter${entry.iteration}` : '';
+    detailFileName = `${String(step).padStart(2, '0')}_${phase}${iterSuffix}_${sessionId}.md`;
   }
+  const detailRef = detailFileName
+    ? ` → detail/${safeName(entry.module)}/${detailFileName}`
+    : '';
+  const line = `${prefix}[${time}] ${globalSeq} ${tag.padEnd(16)} ${mod.padEnd(14)} ${iter.padEnd(4)} ${dur.padStart(7)} ${tokens.padStart(14)}${retry}${code}${chars}  ${summary}${detailRef}\n`;
+  const logPath = path.join(traceDir, `trace-${date}.log`);
+  const logPromise = fs.appendFile(logPath, line, 'utf-8');
+
+  // ----- 3. Per-module detail files + timeline -----
+  let detailPromise: Promise<void> | undefined;
+  if (entry.promptContent || entry.responseContent) {
+    detailPromise = writeModuleDetail(traceDir, entry, globalSeq, dur);
+  } else if (entry.module && (entry.event === 'simulation' || entry.event === 'debug_loop')) {
+    // Non-LLM events (sim results, debug loop markers) also go into the module timeline
+    detailPromise = appendModuleTimeline(traceDir, entry, globalSeq, dur);
+  }
+
+  // Run I/O in parallel where possible
+  await Promise.all([jsonlPromise, logPromise, ...(detailPromise ? [detailPromise] : [])]);
+}
+
+/**
+ * Write a full prompt/response detail file under the module's subdirectory,
+ * then append an entry to the module's _timeline.md index.
+ */
+async function writeModuleDetail(
+  traceDir: string,
+  entry: LLMTraceEntry,
+  globalSeq: string,
+  dur: string,
+): Promise<void> {
+  const moduleSafe = safeName(entry.module);
+  const detailDir = path.join(traceDir, 'detail', moduleSafe);
+  await fs.mkdir(detailDir, { recursive: true });
+
+  // Per-module step counter for local numbering
+  const step = (moduleStepCounters.get(moduleSafe) ?? 0) + 1;
+  moduleStepCounters.set(moduleSafe, step);
+  const stepStr = String(step).padStart(2, '0');
+
+  // Build a readable filename: 01_rtl_fix_iter3_1k3f.md
+  // sessionId suffix prevents collision across process restarts
+  const phase = describePhase(entry);
+  const iterSuffix = entry.iteration !== undefined ? `_iter${entry.iteration}` : '';
+  const fileName = `${stepStr}_${phase}${iterSuffix}_${sessionId}.md`;
+  const detailPath = path.join(detailDir, fileName);
+
+  // ----- Build detail content -----
+  let detail = `# ${entry.module} — ${phase}${iterSuffix}\n\n`;
+  detail += `| Field | Value |\n|-------|-------|\n`;
+  detail += `| Time | ${entry.timestamp} |\n`;
+  detail += `| Global seq | ${globalSeq} |\n`;
+  detail += `| Role | ${entry.role} |\n`;
+  detail += `| Module | ${entry.module} |\n`;
+  if (entry.iteration !== undefined) detail += `| Iteration | ${entry.iteration} |\n`;
+  detail += `| Duration | ${dur} |\n`;
+  detail += `| Tokens | ${entry.promptTokens} prompt / ${entry.completionTokens} completion |\n`;
+  if (entry.promptChars !== undefined) detail += `| Prompt chars | ${entry.promptChars} |\n`;
+  if (entry.responseChars !== undefined) detail += `| Response chars | ${entry.responseChars} |\n`;
+  if (entry.hasCodeBlock !== undefined) detail += `| Has code block | ${entry.hasCodeBlock} |\n`;
+  if (entry.retryCount) detail += `| Retry count | ${entry.retryCount} |\n`;
+  if (entry.summary) detail += `| Summary | ${entry.summary} |\n`;
+  detail += '\n';
+
+  // Full prompt messages — no truncation; this is the deep debug file
+  if (entry.promptContent) {
+    detail += '---\n\n## Prompt Messages\n\n';
+    for (let i = 0; i < entry.promptContent.length; i++) {
+      const msg = entry.promptContent[i];
+      detail += `### [${msg.role.toUpperCase()}] (${msg.content.length} chars)\n\n`;
+      detail += '```\n' + msg.content + '\n```\n\n';
+    }
+  }
+  if (entry.responseContent) {
+    detail += '---\n\n## LLM Response\n\n';
+    detail += '```\n' + entry.responseContent + '\n```\n';
+  }
+
+  await fs.writeFile(detailPath, detail, 'utf-8');
+
+  // Append to module timeline index
+  await appendModuleTimeline(traceDir, entry, globalSeq, dur, fileName);
+}
+
+/**
+ * Append one row to a module's _timeline.md — the quick-scan index for that module.
+ *
+ * On first call per module per session, appends a session separator + table header
+ * (or creates the file if it doesn't exist). Subsequent calls only append rows.
+ */
+async function appendModuleTimeline(
+  traceDir: string,
+  entry: LLMTraceEntry,
+  globalSeq: string,
+  dur: string,
+  detailFile?: string,
+): Promise<void> {
+  const moduleSafe = safeName(entry.module);
+  const timelineDir = path.join(traceDir, 'detail', moduleSafe);
+  await fs.mkdir(timelineDir, { recursive: true });
+  const timelinePath = path.join(timelineDir, '_timeline.md');
+
+  // First call per module this session: append session header (not overwrite)
+  if (!timelineInitialized.has(moduleSafe)) {
+    timelineInitialized.add(moduleSafe);
+    let exists = false;
+    try { await fs.access(timelinePath); exists = true; } catch { /* file does not exist */ }
+    if (exists) {
+      // Existing timeline from previous session — append separator
+      await fs.appendFile(timelinePath,
+        `\n---\n\n### Session ${sessionId} (${new Date().toISOString().split('T')[0]})\n\n` +
+        `| # | Time | Phase | Iter | Duration | Tokens | Summary | Detail |\n` +
+        `|---|------|-------|------|----------|--------|---------|--------|\n`, 'utf-8');
+    } else {
+      // New file
+      const header = `# ${entry.module} — Debug Timeline\n\n` +
+        `### Session ${sessionId} (${new Date().toISOString().split('T')[0]})\n\n` +
+        `| # | Time | Phase | Iter | Duration | Tokens | Summary | Detail |\n` +
+        `|---|------|-------|------|----------|--------|---------|--------|\n`;
+      await fs.writeFile(timelinePath, header, 'utf-8');
+    }
+  }
+
+  const time = entry.timestamp.split('T')[1]?.split('.')[0] ?? '';
+  const tokens = entry.promptTokens > 0 ? `${entry.promptTokens}→${entry.completionTokens}` : '-';
+  const phase = describePhase(entry);
+  const iter = entry.iteration !== undefined ? `${entry.iteration}` : '-';
+  const summary = (entry.summary ?? '').slice(0, 80).replace(/\|/g, '/');
+  const link = detailFile ? `[detail](${detailFile})` : '-';
+
+  const row = `| ${globalSeq} | ${time} | ${phase} | ${iter} | ${dur} | ${tokens} | ${summary} | ${link} |\n`;
+  await fs.appendFile(timelinePath, row, 'utf-8');
+}
+
+/**
+ * Derive a short human-readable phase name from the trace entry.
+ * Used in filenames and timeline.
+ */
+function describePhase(entry: LLMTraceEntry): string {
+  const ctx = entry.taskContext ?? '';
+
+  // Simulation events
+  if (entry.event === 'simulation') {
+    const passed = entry.summary?.includes('PASSED');
+    return passed ? 'sim_PASS' : 'sim_FAIL';
+  }
+  if (entry.event === 'debug_loop') return 'debug_loop';
+  if (entry.event === 'workflow') return 'workflow';
+
+  // LLM call phases — derive from taskContext patterns
+  if (ctx.startsWith('writeModule:')) return 'rtl_write';
+  if (ctx.startsWith('debugFix:')) return 'rtl_fix';
+  if (ctx.startsWith('fixLintErrors:')) return 'lint_fix';
+  if (ctx.startsWith('designer:signal-select:')) return 'signal_select';
+  if (ctx.startsWith('ve-ut:generate:')) return 've_generate';
+  if (ctx.startsWith('ve-ut:review-tb:')) return 've_review';
+  if (ctx.startsWith('ve-ut:compile-fix:')) return 've_compile_fix';
+  if (ctx.startsWith('spec-audit:')) return 'spec_audit';
+  if (ctx.startsWith('ve-st:generate:')) return 've_st_generate';
+  if (ctx.startsWith('architect_p1')) return 'p1_design';
+  if (ctx.startsWith('architect_p2:')) return 'p2_design';
+  if (ctx.startsWith('infra-debug:')) return 'infra_debug';
+  if (ctx.startsWith('sim:')) return 'sim';
+
+  // Fallback: use role
+  return entry.role.toLowerCase().replace(/\s+/g, '_');
 }
 
 // --------------------------------------------------------------------------
@@ -1266,25 +1450,55 @@ async function handleCommand(
       printSystem('Resuming workflow...');
       return {}; // Handled in main loop
     case '/log': {
-      if (currentProjectPath) {
-        const logDir = path.join(currentProjectPath, '.rtl-claw/logs');
-        try {
-          const files = await fs.readdir(logDir);
-          const latest = files.sort().pop();
-          if (latest) {
-            const content = await fs.readFile(path.join(logDir, latest), 'utf-8');
-            const lines = content.split('\n').slice(-20);
-            console.log(chalk.dim('\n  Recent log entries:'));
-            for (const line of lines) console.log(chalk.dim(`  ${line}`));
-            console.log();
-          } else {
-            printSystem('No log files found.');
-          }
-        } catch {
-          printSystem('No logs available.');
-        }
-      } else {
+      if (!currentProjectPath) {
         printSystem('No project open. Open a project first.');
+        return {};
+      }
+      const traceLogDir = path.join(currentProjectPath, '.rtl-claw/logs/llm-trace');
+      const moduleName = parts[1]; // optional: /log counter
+      try {
+        if (moduleName) {
+          // Show per-module timeline
+          const timelinePath = path.join(traceLogDir, 'detail', moduleName, '_timeline.md');
+          try {
+            const timeline = await fs.readFile(timelinePath, 'utf-8');
+            console.log(chalk.dim(`\n  Timeline for module: ${moduleName}\n`));
+            for (const line of timeline.split('\n')) console.log(chalk.dim(`  ${line}`));
+            console.log();
+            // List detail files
+            const detailDir = path.join(traceLogDir, 'detail', moduleName);
+            const files = (await fs.readdir(detailDir)).filter(f => f !== '_timeline.md').sort();
+            if (files.length > 0) {
+              console.log(chalk.dim(`  Detail files (${detailDir}):`));
+              for (const f of files) console.log(chalk.dim(`    ${f}`));
+              console.log();
+            }
+          } catch {
+            printSystem(`No trace data for module "${moduleName}".`);
+          }
+        } else {
+          // Show recent summary log entries
+          const date = new Date().toISOString().split('T')[0];
+          const logPath = path.join(traceLogDir, `trace-${date}.log`);
+          const content = await fs.readFile(logPath, 'utf-8');
+          const lines = content.split('\n').slice(-30);
+          console.log(chalk.dim('\n  Recent trace entries (today):'));
+          for (const line of lines) console.log(chalk.dim(`  ${line}`));
+          // List available modules
+          const detailDir = path.join(traceLogDir, 'detail');
+          try {
+            const modules = (await fs.readdir(detailDir, { withFileTypes: true }))
+              .filter(d => d.isDirectory() && d.name !== '_global')
+              .map(d => d.name);
+            if (modules.length > 0) {
+              console.log(chalk.dim(`\n  Modules with traces: ${modules.join(', ')}`));
+              console.log(chalk.dim(`  Use /log <module> to view module timeline`));
+            }
+          } catch { /* no detail dir yet */ }
+          console.log();
+        }
+      } catch {
+        printSystem('No trace logs available for today.');
       }
       return {};
     }
@@ -2303,6 +2517,7 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
     // Keep stdin flowing so our raw 'data' listener can detect Esc
     process.stdin.resume();
     printUser();
+    spinner.resetTimer();
     spinner.start('Thinking...');
 
     // Build context
@@ -2334,7 +2549,12 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
         return pm.loadWorkflowState(projPath);
       };
       context.logLLMTrace = async (entry: LLMTraceEntry) => {
-        await writeLLMTrace(projPath, entry);
+        try {
+          await writeLLMTrace(projPath, entry);
+        } catch (err) {
+          // Trace is observability — never crash the main workflow
+          process.stderr.write(`  [Trace] write failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
       };
       context.readFile = async (relativePath: string) => {
         return fs.readFile(path.resolve(projPath, relativePath), 'utf-8');
@@ -2350,6 +2570,8 @@ export async function startApp(configManager: ConfigManager, projectPath?: strin
 
     try {
       await processOrchestratorOutput(orchestrator, input, context, spinner);
+      // Show total task duration
+      console.log(chalk.dim(`  Done in ${spinner.elapsed}`));
     } catch (err) {
       spinner.stop();
       // Don't show error for user-initiated abort
